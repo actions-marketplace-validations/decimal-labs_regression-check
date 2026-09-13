@@ -8,11 +8,20 @@ branding:
 
 inputs:
   api-key:
-    description: 'DecimalAI API key. Pull from GitHub Secrets.'
-    required: true
+    description: |
+      DecimalAI API key. Pull from GitHub Secrets. Omit it to run in FIXTURE MODE:
+      the Action skips the API, renders a committed public fixture (the seeded demo
+      agent from docs.decimal.ai/tutorials/two-minute-demo) and posts the same PR
+      comment a real run would, with a first line saying it is sample data. The job
+      never fails in fixture mode. Add the key and the same workflow checks your agent.
+    required: false
+    default: ''
   agent-name:
-    description: 'Agent name (matches the value passed to decimalai.init()).'
-    required: true
+    description: |
+      Agent name (matches the value passed to decimalai.init()). Required for a live
+      run; in fixture mode it is only the label on the comment.
+    required: false
+    default: ''
   candidate-manifest-id:
     description: |
       Candidate manifest ID. If omitted, the action reads it from
@@ -76,6 +85,8 @@ inputs:
     default: 'off'
 
 outputs:
+  mode:
+    description: '`live` when the check ran against DecimalAI, `fixture` when no api-key was supplied and the committed sample report was rendered.'
   verdict:
     description: |
       Final verdict: high_risk, medium_risk, low_risk, no_change, unverified,

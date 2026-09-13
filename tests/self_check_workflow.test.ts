@@ -126,3 +126,26 @@ describe('self-check: the key is never pasted into a script body', () => {
     expect(text).toContain('limit=1');
   });
 });
+
+describe('self-check: the fixture-mode step is genuinely keyless', () => {
+  it('passes neither api-key nor candidate-manifest-id', () => {
+    // The step exists to exercise the path a stranger's first run takes. A key that
+    // slipped in through a copy-paste would make it a second live run and leave the
+    // keyless path untested again — which is the state 1.2.0 fixed.
+    const text = readFileSync(WORKFLOW, 'utf8');
+    const start = text.indexOf('Fixture-mode self-check');
+    expect(start).toBeGreaterThan(-1);
+    const block = text.slice(start);
+    expect(block).not.toContain('api-key');
+    expect(block).not.toContain('candidate-manifest-id');
+    expect(block).toContain('uses: ./');
+  });
+
+  it('runs whenever the live check could not', () => {
+    const text = readFileSync(WORKFLOW, 'utf8');
+    const block = text.slice(text.indexOf('Fixture-mode self-check'));
+    expect(block).toMatch(/if: steps\.gate\.outputs\.present != 'true' \|\| steps\.manifest\.outputs\.found != 'true'/);
+    // and the job no longer skips forks wholesale
+    expect(text).not.toMatch(/^\s+if: github\.event\.pull_request\.head\.repo\.full_name == github\.repository/m);
+  });
+});

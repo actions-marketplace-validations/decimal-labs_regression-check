@@ -2,7 +2,7 @@
  * Decimal regression-check Action — main entry point.
  *
  * Flow:
- *   1. Parse inputs
+ *   1. Parse inputs (no api-key → fixture mode: steps 2–4 are replaced by the committed report)
  *   2. Resolve candidate manifest ID (from input or $GITHUB_OUTPUT or local file)
  *   3. Build PR context from github.context
  *   4. POST /api/v1/regression-check
@@ -25,6 +25,7 @@ import {
 } from './api';
 import { formatComment, formatUnavailableComment, upsertPrComment } from './comment';
 import { parseInputs, FailOn } from './inputs';
+import { fixtureReport, FIXTURE_DOCS_URL } from './fixture';
 
 const VERDICT_RANK: Record<Verdict, number> = {
   no_change: 0,
@@ -104,75 +105,93 @@ async function main(): Promise<void> {
     return;
   }
 
-  core.info(`Running regression check for agent='${inputs.agentName}' candidate='${inputs.candidateManifestId}'`);
-
   const githubTokenForComment = inputs.githubToken;
   if (githubTokenForComment) core.setSecret(githubTokenForComment); // mask the token in Action logs
 
   let report;
-  try {
-    report = await runRegressionCheck({
-      baseUrl: inputs.baseUrl,
-      apiKey: inputs.apiKey,
-      agentName: inputs.agentName,
-      candidateManifestId: inputs.candidateManifestId,
-      prContext: buildPrContext(),
-      traceWindowDays: inputs.traceWindowDays,
-    });
-  } catch (e) {
-    const reason = (e as Error).message;
-    // A transient failure to RUN the check — a 5xx, a network blip, a
-    // rate-limit 429 — is not a regression in the caller's code. Under
-    // `on-error: warn` it must leave the job green and report `unavailable`;
-    // only a verdict the server actually returned may reach shouldFail(), so
-    // `fail-on: none` stays advisory.
-    if (isTransientApiFailure(e) && inputs.onError === 'warn') {
-      core.warning(`Agent Regression Check unavailable — ${reason}`);
-      // Outputs still get set so downstream steps branch on a real value
-      // rather than an empty string.
-      core.setOutput('verdict', 'unavailable');
-      core.setOutput('high-risk-count', '0');
-      core.setOutput('medium-risk-count', '0');
-      core.setOutput('low-risk-count', '0');
-      if (githubTokenForComment) {
-        try {
-          await upsertPrComment({
-            githubToken: githubTokenForComment,
-            body: formatUnavailableComment(inputs.agentName, reason),
-            mode: inputs.commentMode,
-          });
-        } catch (commentErr) {
-          core.warning(
-            `Failed to upsert PR comment: ${(commentErr as Error).message}`,
-          );
+  let callReplay: CallReplayResult | undefined;
+
+  if (inputs.fixtureMode) {
+    // No api-key: render the committed fixture and never touch the network. The
+    // comment's first line and this notice both say so; the job cannot fail on it.
+    core.notice(
+      'Fixture run: no api-key was supplied, so this report is rendered from a committed ' +
+        'public fixture (the seeded demo agent), not from your traffic. Add api-key to check ' +
+        'your own agent.',
+    );
+    report = fixtureReport(inputs.agentName || undefined);
+  } else {
+    core.info(`Running regression check for agent='${inputs.agentName}' candidate='${inputs.candidateManifestId}'`);
+    try {
+      report = await runRegressionCheck({
+        baseUrl: inputs.baseUrl,
+        apiKey: inputs.apiKey,
+        agentName: inputs.agentName,
+        candidateManifestId: inputs.candidateManifestId,
+        prContext: buildPrContext(),
+        traceWindowDays: inputs.traceWindowDays,
+      });
+    } catch (e) {
+      const reason = (e as Error).message;
+      // A transient failure to RUN the check — a 5xx, a network blip, a
+      // rate-limit 429 — is not a regression in the caller's code. Under
+      // `on-error: warn` it must leave the job green and report `unavailable`;
+      // only a verdict the server actually returned may reach shouldFail(), so
+      // `fail-on: none` stays advisory.
+      if (isTransientApiFailure(e) && inputs.onError === 'warn') {
+        core.warning(`Agent Regression Check unavailable — ${reason}`);
+        // Outputs still get set so downstream steps branch on a real value
+        // rather than an empty string.
+        core.setOutput('mode', 'live');
+        core.setOutput('verdict', 'unavailable');
+        core.setOutput('high-risk-count', '0');
+        core.setOutput('medium-risk-count', '0');
+        core.setOutput('low-risk-count', '0');
+        if (githubTokenForComment) {
+          try {
+            await upsertPrComment({
+              githubToken: githubTokenForComment,
+              body: formatUnavailableComment(inputs.agentName, reason),
+              mode: inputs.commentMode,
+            });
+          } catch (commentErr) {
+            core.warning(
+              `Failed to upsert PR comment: ${(commentErr as Error).message}`,
+            );
+          }
         }
+        return; // exit 0 — advisory, per on-error: warn
       }
-      return; // exit 0 — advisory, per on-error: warn
+      core.setFailed(`Regression check failed: ${reason}`);
+      return;
     }
-    core.setFailed(`Regression check failed: ${reason}`);
-    return;
   }
 
   // Set outputs
+  core.setOutput('mode', inputs.fixtureMode ? 'fixture' : 'live');
   core.setOutput('verdict', report.verdict);
   core.setOutput('high-risk-count', String(report.high_risk_count));
   core.setOutput('medium-risk-count', String(report.medium_risk_count));
   core.setOutput('low-risk-count', String(report.low_risk_count));
   core.setOutput('regression-check-id', report.id);
-  core.setOutput('report-url', buildReportUrl(inputs.baseUrl, inputs.agentName, report.id));
+  core.setOutput(
+    'report-url',
+    inputs.fixtureMode ? FIXTURE_DOCS_URL : buildReportUrl(inputs.baseUrl, inputs.agentName, report.id),
+  );
 
   // Log a summary regardless of PR context
   core.info(
     `Verdict: ${report.verdict.toUpperCase()} | ` +
-      `HIGH=${report.high_risk_count} MEDIUM=${report.medium_risk_count} LOW=${report.low_risk_count}`,
+      `HIGH=${report.high_risk_count} MEDIUM=${report.medium_risk_count} LOW=${report.low_risk_count}` +
+      (inputs.fixtureMode ? ' (fixture)' : ''),
   );
   core.info(report.verdict_message);
 
   // Behavioral verification (opt-in). Re-issues recorded model calls against
   // the candidate model when behavioral-check != off AND the diff has a model
-  // change. Informational only — never fails the action.
-  let callReplay: CallReplayResult | undefined;
-  if (inputs.behavioralCheck !== 'off') {
+  // change. Informational only — never fails the action. Not in fixture mode:
+  // there is no run on the server to replay.
+  if (!inputs.fixtureMode && inputs.behavioralCheck !== 'off') {
     const hasModelChange = (report.diff_summary?.changes || []).some(
       (c) => c.type === 'model_changed',
     );
@@ -207,7 +226,7 @@ async function main(): Promise<void> {
     try {
       await upsertPrComment({
         githubToken,
-        body: formatComment(report, inputs.baseUrl, callReplay),
+        body: formatComment(report, inputs.baseUrl, callReplay, { fixture: inputs.fixtureMode }),
         mode: inputs.commentMode,
       });
     } catch (e) {
@@ -219,8 +238,9 @@ async function main(): Promise<void> {
     core.info('GITHUB_TOKEN not present — skipping PR comment post.');
   }
 
-  // Exit code per fail-on policy
-  if (shouldFail(report.verdict, inputs.failOn, report.structural_severity)) {
+  // Exit code per fail-on policy. Never in fixture mode: the fixture's verdict is
+  // high_risk by design, and a demo must not red a stranger's pull request.
+  if (!inputs.fixtureMode && shouldFail(report.verdict, inputs.failOn, report.structural_severity)) {
     core.setFailed(
       `Verdict '${report.verdict}' meets fail-on threshold '${inputs.failOn}'. ${report.verdict_message}`,
     );

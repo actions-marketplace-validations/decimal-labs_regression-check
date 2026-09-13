@@ -26,9 +26,9 @@ jobs:
   self-check:
     name: Run this Action against a seeded agent
     runs-on: ubuntu-latest
-    # Fork PRs cannot read secrets, so the step below would fail on a missing
-    # key rather than on anything meaningful. Skip rather than fail red.
-    if: github.event.pull_request.head.repo.full_name == github.repository || github.event_name == 'workflow_dispatch'
+    # A fork PR cannot read this repository's secret values. Until 1.2.0 the whole job skipped on a fork;
+    # now the key-bearing steps skip (the gate below) and the fixture-mode step
+    # runs instead, which is exactly the path a stranger's first run takes.
     steps:
       - uses: actions/checkout@v6
 
@@ -103,6 +103,18 @@ jobs:
           candidate-manifest-id: ${{ steps.manifest.outputs.id }}
           # Observe, never block. A red self-check on an unrelated PR teaches
           # people to ignore this job, which is worse than not having it.
+          fail-on: none
+          on-error: warn
+          comment-mode: update
+
+      - name: Fixture-mode self-check (no key)
+        # The keyless path (1.2.0): the same comment, rendered from the committed
+        # fixture, on every PR that could not run the live check — forks included.
+        # Deliberately passes no key and no manifest id; the test
+        # tests/self_check_workflow.test.ts pins that.
+        if: steps.gate.outputs.present != 'true' || steps.manifest.outputs.found != 'true'
+        uses: ./
+        with:
           fail-on: none
           on-error: warn
           comment-mode: update

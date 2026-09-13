@@ -19,6 +19,7 @@ import {
   buildReportUrl,
 } from './api';
 import { CommentMode } from './inputs';
+import { FIXTURE_BANNER, FIXTURE_DOCS_URL } from './fixture';
 
 /** Hidden marker for finding our existing comment on update mode. */
 const MARKER = '<!-- decimalai-regression-check-comment -->';
@@ -303,9 +304,17 @@ export function formatComment(
   report: RegressionCheckResponse,
   baseUrl: string,
   callReplay?: CallReplayResult | null,
+  opts?: { fixture?: boolean },
 ): string {
   const lines: string[] = [];
   lines.push(MARKER);
+  // Fixture mode: the very next line says this is sample data, above the heading, so no
+  // reader can scroll past it to a red verdict. MARKER stays first — update mode finds
+  // the existing comment by it.
+  if (opts?.fixture) {
+    lines.push(FIXTURE_BANNER);
+    lines.push('');
+  }
   lines.push(`### 🔍 Agent Regression Check — \`${mdCode(report.agent_name)}\``);
   lines.push('');
 
@@ -559,9 +568,14 @@ export function formatComment(
     }
   }
 
-  // Report link
-  const reportUrl = buildReportUrl(baseUrl, report.agent_name, report.id);
-  lines.push(`[View full report →](${reportUrl})`);
+  // Report link. A fixture has no report on the dashboard — the link would 404 — so it
+  // points at the demo the fixture was captured from.
+  if (opts?.fixture) {
+    lines.push(`[See this on a real agent — two-minute demo →](${FIXTURE_DOCS_URL})`);
+  } else {
+    const reportUrl = buildReportUrl(baseUrl, report.agent_name, report.id);
+    lines.push(`[View full report →](${reportUrl})`);
+  }
 
   lines.push(FOOTER);
   return lines.join('\n');
