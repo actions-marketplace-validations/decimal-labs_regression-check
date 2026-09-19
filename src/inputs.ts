@@ -35,6 +35,14 @@ export interface ActionInputs {
    * string when no token is available — the comment step is then skipped.
    */
   githubToken: string;
+  /**
+   * True when no `api-key` was supplied. The Action then renders the committed fixture
+   * (src/fixture.ts) instead of calling the API, never fails the job, and says so in the
+   * first line of its comment. `agent-name` and `candidate-manifest-id` are not required
+   * in this mode; every other input is still validated, because a typo'd `fail-on` is a
+   * misconfiguration in both modes.
+   */
+  fixtureMode: boolean;
 }
 
 const FAIL_ON_VALUES: FailOn[] = ['high', 'medium', 'none'];
@@ -43,13 +51,18 @@ const BEHAVIORAL_CHECK_VALUES: BehavioralCheck[] = ['off', 'mock', 'real'];
 const ON_ERROR_VALUES: OnError[] = ['warn', 'fail'];
 
 export function parseInputs(): ActionInputs {
-  const apiKey = core.getInput('api-key', { required: true });
+  // Optional since 1.2.0: absent means fixture mode. Decided FIRST, because the two
+  // required-input checks below are conditional on it.
+  const apiKey = core.getInput('api-key');
+  const fixtureMode = !apiKey;
   // Register the key for log masking regardless of how the
   // caller supplied it — values from vars.*/matrix/literals are NOT auto-masked like
   // secrets.* are, so without this an error body or future log line could print it in
   // plaintext in the (publicly readable, ~90-day) Action log.
   if (apiKey) core.setSecret(apiKey);
-  const agentName = core.getInput('agent-name', { required: true });
+  // Still required for a live run: without it there is no agent to check. The fixture
+  // carries its own name, so in fixture mode it is only a label.
+  const agentName = fixtureMode ? core.getInput('agent-name') : core.getInput('agent-name', { required: true });
 
   const failOnRaw = (core.getInput('fail-on') || 'high').toLowerCase();
   if (!FAIL_ON_VALUES.includes(failOnRaw as FailOn)) {
@@ -85,8 +98,9 @@ export function parseInputs(): ActionInputs {
   }
 
   const explicitId = core.getInput('candidate-manifest-id');
-  const candidateManifestId = explicitId || resolveCandidateManifestId();
-  if (!candidateManifestId) {
+  // Fixture mode has no manifest to resolve; a live run must find one or stop loudly.
+  const candidateManifestId = fixtureMode ? explicitId : explicitId || resolveCandidateManifestId();
+  if (!fixtureMode && !candidateManifestId) {
     throw new Error(
       'No candidate-manifest-id provided or discoverable. ' +
         'Either pass it explicitly or run decimalai.flush_manifest_for_ci() ' +
@@ -136,6 +150,7 @@ export function parseInputs(): ActionInputs {
     behavioralCheck: behavioralRaw as BehavioralCheck,
     onError: onErrorRaw as OnError,
     githubToken,
+    fixtureMode,
   };
 }
 

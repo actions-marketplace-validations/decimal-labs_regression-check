@@ -69,21 +69,34 @@ jobs:
       # whether they run. A bundle that resolves no modules would pass that and
       # break for everyone on first use.
       #
-      # These two assertions need no API key, so unlike the manifest step below
+      # These assertions need no API key, so unlike the manifest step below
       # they run on every push and on forks. Each pins a documented contract:
-      #   1. a missing required input is fatal and names the input;
-      #   2. an unreachable backend under `on-error: warn` exits 0 and reports
+      #   1. no api-key at all is FIXTURE MODE (1.2.0): exit 0, the log says so,
+      #      and the fixture's verdict is rendered — a stranger's first run;
+      #   2. a key WITHOUT an agent-name is still a loud misconfiguration —
+      #      relaxing api-key must not relax the live run's other required input;
+      #   3. an unreachable backend under `on-error: warn` exits 0 and reports
       #      unavailable — our downtime is not the user's regression.
       - name: Smoke the built action
         run: |
           set -euo pipefail
 
-          echo "--- missing required input must fail loudly"
-          if node dist/index.js > out1.txt 2>&1; then
-            echo "FAIL: expected a non-zero exit for a missing api-key"; cat out1.txt; exit 1
+          echo "--- no inputs at all is a fixture run and stays green"
+          if ! node dist/index.js > out1.txt 2>&1; then
+            echo "FAIL: a keyless run must exit 0 (fixture mode)"; cat out1.txt; exit 1
           fi
-          grep -q '::error::.*api-key' out1.txt \
-            || { echo "FAIL: no ::error:: naming api-key"; cat out1.txt; exit 1; }
+          grep -qi 'fixture' out1.txt \
+            || { echo "FAIL: expected the run to say it rendered the fixture"; cat out1.txt; exit 1; }
+          grep -q 'HIGH_RISK' out1.txt \
+            || { echo "FAIL: expected the fixture verdict in the log"; cat out1.txt; exit 1; }
+          echo "ok"
+
+          echo "--- a key without an agent-name must still fail loudly"
+          if env "INPUT_API-KEY=dai_sk_smoke_not_a_real_key" node dist/index.js > out1b.txt 2>&1; then
+            echo "FAIL: expected a non-zero exit for a missing agent-name"; cat out1b.txt; exit 1
+          fi
+          grep -q '::error::.*agent-name' out1b.txt \
+            || { echo "FAIL: no ::error:: naming agent-name"; cat out1b.txt; exit 1; }
           echo "ok"
 
           echo "--- unreachable backend with on-error:warn must stay green"

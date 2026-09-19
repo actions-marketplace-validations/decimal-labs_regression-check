@@ -1,0 +1,120 @@
+# Runs this Action against itself, so "it works" stops being an assumption.
+#
+# Until 2026-08-22 the comment-posting path — the Action's entire visible output —
+# had never executed against a real pull request anywhere, and no repository on
+# earth consumed it. Every doc and the Claude Code plugin point strangers at it.
+# The core path is now proven (a local run against the live API produced
+# verdict=high_risk, HIGH=2 MEDIUM=118 LOW=0 and a real regression-check id), but
+# a local run cannot exercise the one thing a user actually sees: the PR comment.
+# This workflow closes that gap and keeps it closed.
+#
+# It is deliberately non-blocking. The point is to observe the Action's own
+# behaviour, not to gate this repo's commits on a live external service — a
+# self-test that can wedge the repo when the API is down would get deleted.
+name: Self-check
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write   # the whole point: let it post its own comment
+
+jobs:
+  self-check:
+    name: Run this Action against a seeded agent
+    runs-on: ubuntu-latest
+    # A fork PR cannot read this repository's secret values. Until 1.2.0 the whole job skipped on a fork;
+    # now the key-bearing steps skip (the gate below) and the fixture-mode step
+    # runs instead, which is exactly the path a stranger's first run takes.
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Build the bundle from source
+        # Test what this PR would ship, not what dist/ happened to contain.
+        run: |
+          npm ci
+          npm run build
+
+      - name: Is the key present?
+        id: gate
+        # Read the secret from the environment, never by interpolating it into
+        # the script body. A `${{ }}` expression is pasted into the shell text
+        # before bash ever sees it, so the value has to be shell-safe for the
+        # script to even parse. The env form carries no such requirement, and
+        # it is what the next step already does.
+        env:
+          DECIMAL_API_KEY: ${{ secrets.DECIMAL_API_KEY }}
+        run: |
+          if [ -n "${DECIMAL_API_KEY}" ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::DECIMAL_API_KEY is not set — skipping. Add it in Settings → Secrets and variables → Actions to enable the self-check."
+          fi
+
+      - name: Resolve a candidate manifest
+        # A real consumer gets this from decimalai.flush_manifest_for_ci() in a
+        # prior step, which writes decimal_manifest_id to $GITHUB_OUTPUT. This
+        # repo has no agent to flush, so it resolves the seeded demo agent's
+        # newest manifest instead. Without it the Action stops with "No
+        # candidate-manifest-id provided or discoverable" — which is exactly how
+        # the scaffolded workflow failed on its first real PR (8aa7b08 in the
+        # plugin repo), so leaving it implicit here would re-stage that bug.
+        #
+        # This step NEVER fails the job. It used to: `curl -sf` under `set -e`
+        # exits non-zero on any 5xx, 429 or network error, so a DecimalAI blip
+        # reddened a run that has nothing to do with DecimalAI. The Action is
+        # careful about precisely that (`on-error: warn`); a hand-rolled
+        # prerequisite in front of it must not quietly undo the guarantee.
+        id: manifest
+        if: steps.gate.outputs.present == 'true'
+        env:
+          DECIMAL_API_KEY: ${{ secrets.DECIMAL_API_KEY }}
+          AGENT_NAME: '[Demo] support-agent'
+        run: |
+          set -euo pipefail
+          # Filter server-side: the endpoint takes ?agent_name= and returns
+          # newest-first, so one row is exact. Paging the org and filtering here
+          # finds nothing once 20 newer manifests exist anywhere in it (20 is
+          # the endpoint's default limit) — and would report that as green.
+          RESP=$(curl -sf --max-time 30 --get \
+                   --data-urlencode "agent_name=${AGENT_NAME}" \
+                   --data-urlencode "limit=1" \
+                   -H "Authorization: Bearer ${DECIMAL_API_KEY}" \
+                   https://api.decimal.ai/api/v1/manifests) || RESP=''
+          MID=$(printf '%s' "$RESP" | python3 -c "import json,sys;raw=sys.stdin.read().strip();d=(json.loads(raw) if raw else {});i=d if isinstance(d,list) else (d.get('manifests') or d.get('items') or []);print(i[0]['id'] if i else '')" 2>/dev/null) || MID=''
+          if [ -z "$MID" ]; then
+            echo "::warning::no manifest resolved for ${AGENT_NAME} — skipping the check. Either the API was unreachable or the demo agent has none. This is a skip, not a failure."
+            echo "found=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "found=true" >> "$GITHUB_OUTPUT"
+            echo "id=$MID" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Regression check against the seeded demo agent
+        if: steps.gate.outputs.present == 'true' && steps.manifest.outputs.found == 'true'
+        uses: ./
+        with:
+          api-key: ${{ secrets.DECIMAL_API_KEY }}
+          agent-name: '[Demo] support-agent'
+          candidate-manifest-id: ${{ steps.manifest.outputs.id }}
+          # Observe, never block. A red self-check on an unrelated PR teaches
+          # people to ignore this job, which is worse than not having it.
+          fail-on: none
+          on-error: warn
+          comment-mode: update
+
+      - name: Fixture-mode self-check (no key)
+        # The keyless path (1.2.0): the same comment, rendered from the committed
+        # fixture, on every PR that could not run the live check — forks included.
+        # Deliberately passes no key and no manifest id; the test
+        # tests/self_check_workflow.test.ts pins that.
+        if: steps.gate.outputs.present != 'true' || steps.manifest.outputs.found != 'true'
+        uses: ./
+        with:
+          fail-on: none
+          on-error: warn
+          comment-mode: update

@@ -95,12 +95,34 @@ That's it. Open a PR and the impact report shows up as a comment within ~30 seco
 
 ---
 
+## Try it with no account
+
+Run the Action with no `api-key` and it renders a committed sample report — the seeded demo agent from
+the [two-minute demo](https://docs.decimal.ai/tutorials/two-minute-demo): six manifest changes, 120
+traces, 2 high-risk — and posts exactly the comment above, with a first line saying it is sample data.
+No API call, no signup, and the job never fails. Eight lines in `.github/workflows/agent-check.yml`:
+
+```yaml
+on: pull_request
+permissions:
+  pull-requests: write
+jobs:
+  agent-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: decimal-labs/regression-check@v1
+```
+
+When you want it against your own agent, add `api-key: ${{ secrets.DECIMAL_API_KEY }}` (free key at
+[app.decimal.ai/settings](https://app.decimal.ai/settings)) and an `agent-name`, and follow the
+setup below.
+
 ## Inputs
 
 | Name | Required | Default | Description |
 |---|---|---|---|
-| `api-key` | yes | — | DecimalAI API key. Pull from GitHub Secrets. |
-| `agent-name` | yes | — | Agent name (matches the value passed to `decimalai.init()`). |
+| `api-key` | no | — | DecimalAI API key. Pull from GitHub Secrets. **Omit it to run in fixture mode** (see above): no API call, the committed sample report is rendered, the job never fails. |
+| `agent-name` | no (yes for a live run) | — | Agent name (matches the value passed to `decimalai.init()`). Required whenever `api-key` is set; in fixture mode it only labels the comment. |
 | `github-token` | no | `${{ github.token }}` | Token used to post / update the PR impact comment. Defaults to the automatic per-job token, so the comment works out of the box once the workflow grants `pull-requests: write`. Override only for a different token (e.g. a PAT to comment on forked PRs). Falls back to the `GITHUB_TOKEN` / `GH_TOKEN` env vars if set empty. |
 | `candidate-manifest-id` | no | (auto) | If omitted, reads from `$GITHUB_OUTPUT` (the standard handoff from `decimalai.flush_manifest_for_ci()`) or `./decimal_manifest_id.txt`. |
 | `base-url` | no | `https://api.decimal.ai` | DecimalAI API base URL. Defaults to production. Override only if DecimalAI directs you to a different API host. |
@@ -114,6 +136,7 @@ That's it. Open a PR and the impact report shows up as a comment within ~30 seco
 
 | Name | Description |
 |---|---|
+| `mode` | `live` when the check ran against DecimalAI, `fixture` when no `api-key` was supplied and the sample report was rendered. |
 | `verdict` | One of: `high_risk`, `medium_risk`, `low_risk`, `no_change`, `unverified`, `first_run` — or `unavailable` when the check could not run and `on-error` is `warn`. |
 | `high-risk-count` | Number of HIGH RISK traces in the report. |
 | `medium-risk-count` | Number of MEDIUM RISK traces. |

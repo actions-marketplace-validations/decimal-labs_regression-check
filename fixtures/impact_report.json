@@ -1,0 +1,541 @@
+{
+  "_README": "The report the Action renders in FIXTURE MODE (no api-key). Captured 2026-09-13 from a local backend after `decimalai demo regression`, which seeds the two-minute demo's `[Demo] support-agent` (v1 -> v2: get_pricing renamed to lookup_price, compare_competitors removed, refund_order added, check_inventory gains an optional param, the system prompt rewritten, the model snapshot bumped) with 120 traces and runs the production regression check over them: 2 high / 118 medium / 0 low. Ids, hashes, timestamps and pr_context are placeholders; every other field is the backend's own answer. Regenerate: run a backend, `DECIMAL_API_KEY=<key> decimalai demo regression --base-url <url>`, then GET /api/v1/regression-check/{id} with the same key and re-apply the placeholders. The numbers must match docs.decimal.ai/tutorials/two-minute-demo and the README image, so the Action, the CLI demo and the docs tell one story.",
+  "id": "fixture-demo-support-agent",
+  "agent_name": "[Demo] support-agent",
+  "baseline_manifest_id": "fixture-manifest-v1",
+  "candidate_manifest_id": "fixture-manifest-v2",
+  "status": "completed",
+  "verdict": "high_risk",
+  "verdict_message": "2 traces will break. Review before merging. (also: 118 medium-risk affected)",
+  "structural_severity": "high",
+  "human_summary": "Renamed `get_pricing` → `lookup_price`, added tool `refund_order`, removed tool `compare_competitors`, changed `check_inventory` schema… +more changes.",
+  "high_risk_count": 2,
+  "medium_risk_count": 118,
+  "low_risk_count": 0,
+  "total_traces_analyzed": 120,
+  "diff_summary": {
+    "total_changes": 6,
+    "high_severity_changes": 1,
+    "medium_severity_changes": 3,
+    "low_severity_changes": 2,
+    "changes": [
+      {
+        "type": "tool_renamed",
+        "name": "lookup_price",
+        "severity": "medium",
+        "detail": {
+          "old_name": "get_pricing",
+          "new_name": "lookup_price",
+          "content_hash": "d57677263d45eed7"
+        }
+      },
+      {
+        "type": "model_changed",
+        "name": "gpt-4o-mini",
+        "severity": "medium",
+        "detail": {
+          "severity": "moderate",
+          "change_type": "version_bump",
+          "old_model": "gpt-4o-mini-2024-07-18",
+          "new_model": "gpt-4o-mini-2024-09-12",
+          "grade": "moderate",
+          "change_kind": "version_bump",
+          "policy": {
+            "name": "default",
+            "disposition": "flag",
+            "implies": "warn"
+          }
+        }
+      },
+      {
+        "type": "prompt_section_rewritten",
+        "name": "system_prompt",
+        "severity": "medium",
+        "detail": {
+          "diff_pct": 88.6,
+          "severity": "major",
+          "grade": "major",
+          "change_kind": "prompt_major",
+          "policy": {
+            "name": "default",
+            "disposition": "replay",
+            "implies": "warn"
+          }
+        }
+      },
+      {
+        "type": "tool_schema_optional_param_added",
+        "name": "check_inventory",
+        "severity": "low",
+        "detail": {
+          "params": [
+            "region"
+          ]
+        }
+      },
+      {
+        "type": "tool_added",
+        "name": "refund_order",
+        "severity": "low",
+        "detail": {}
+      },
+      {
+        "type": "tool_removed",
+        "name": "compare_competitors",
+        "severity": "high",
+        "detail": {}
+      }
+    ]
+  },
+  "pr_context": null,
+  "error_message": null,
+  "created_at": "2026-09-13T00:00:00Z",
+  "eval_verdict": "regression_likely",
+  "eval_breakdown": {
+    "passing_affected": 15,
+    "failing_affected": 5,
+    "unscored_affected": 100,
+    "eval_capped": false
+  },
+  "downstream_impact": {
+    "evaluators": {
+      "stale_count": 0,
+      "sample_evaluator_names": [],
+      "surfaces_causing_staleness": [
+        "tool_removed: high",
+        "tool_renamed: medium",
+        "model_changed: medium"
+      ]
+    },
+    "datasets": {
+      "affected_dataset_version_count": 1,
+      "sample_dataset_names": [
+        "[Demo] support-agent SFT set"
+      ],
+      "total_rows_invalidated": 10
+    },
+    "subagents": {
+      "broken_handoffs": []
+    },
+    "skills": {
+      "affected_agent_count": 0,
+      "sample_agent_names": [],
+      "skills_changed": []
+    }
+  },
+  "call_replay": null,
+  "source": "fixture",
+  "baseline_manifest_label": "v1",
+  "baseline_manifest_hash": "000000000000",
+  "candidate_manifest_label": "v2",
+  "candidate_manifest_hash": "000000000000",
+  "human_decision": null,
+  "impacts": [
+    {
+      "id": "ddbd5bcb-dc3a-4aeb-aa4c-f767df5895cd",
+      "surface_change_type": "tool_renamed",
+      "surface_name": "lookup_price",
+      "severity": "medium",
+      "affected_trace_count": 1,
+      "sample_trace_ids": [
+        "75d27b98-4f71-56b0-9dcb-a00089c47aa6"
+      ],
+      "explanation": "1 traces called `get_pricing` (now renamed to `lookup_price`). Runtime resolution by content_hash will keep working, but hard-coded references to the old name in eval rules, telemetry filters, or downstream code will need updating.",
+      "eval_breakdown": {
+        "passing_affected": 1,
+        "failing_affected": 0,
+        "unscored_affected": 0,
+        "sample_passing_trace_ids": [
+          "75d27b98-4f71-56b0-9dcb-a00089c47aa6"
+        ],
+        "sample_failing_trace_ids": [],
+        "sample_unscored_trace_ids": [],
+        "failing_eval_details": [],
+        "top_failing_evals": []
+      }
+    },
+    {
+      "id": "c3a10643-d734-4919-b1cc-de186668145a",
+      "surface_change_type": "model_changed",
+      "surface_name": "gpt-4o-mini",
+      "severity": "medium",
+      "affected_trace_count": 120,
+      "sample_trace_ids": [
+        "75734f85-7546-5cbe-a39f-418c6f8d21dd",
+        "766e63d8-8fdf-5112-a10d-8b9f0891e567",
+        "60200eff-0ae6-573b-ae1d-d189694d096c",
+        "d49c18c6-183f-5372-9a45-9019799d0deb",
+        "3c86b73f-49ff-590e-b2ae-ac942e87a1b6"
+      ],
+      "explanation": "Model version bump (gpt-4o-mini-2024-07-18 → gpt-4o-mini-2024-09-12) — moderate. All 120 traces in the window will use the new model. Behavioral direction can't be predicted structurally — use post-deploy bisect (CUJ 11) to verify actual impact.",
+      "eval_breakdown": {
+        "passing_affected": 15,
+        "failing_affected": 5,
+        "unscored_affected": 100,
+        "sample_passing_trace_ids": [
+          "766e63d8-8fdf-5112-a10d-8b9f0891e567",
+          "60200eff-0ae6-573b-ae1d-d189694d096c",
+          "d49c18c6-183f-5372-9a45-9019799d0deb",
+          "3c86b73f-49ff-590e-b2ae-ac942e87a1b6",
+          "988dea1d-0ec3-50d9-93dd-418cda477be2"
+        ],
+        "sample_failing_trace_ids": [
+          "75734f85-7546-5cbe-a39f-418c6f8d21dd",
+          "dc32839f-0d76-5838-9fb4-5d779835735b",
+          "0e452cd9-0c50-551f-b73e-b1c5aa265763",
+          "3aa817a2-fb82-51b7-98d6-c6d7bf597c84",
+          "cffe0827-747a-5019-ad7d-da2e78336f4c"
+        ],
+        "sample_unscored_trace_ids": [
+          "3295775d-e720-4882-8cfe-3205513a3164",
+          "3008856a-cbb7-4db1-849b-e1e5dd2af46c",
+          "f0e87139-92ac-4335-bb8c-d6fc604b3810",
+          "ad33930c-0ba4-4192-ba7e-9e5a7c240258",
+          "c38c756e-91c0-4cc1-800c-35625705c70e"
+        ],
+        "failing_eval_details": [
+          {
+            "trace_id": "75734f85-7546-5cbe-a39f-418c6f8d21dd",
+            "failed_evals": [
+              {
+                "name": "completion",
+                "score": 0.0,
+                "source": "built_in"
+              },
+              {
+                "name": "quality",
+                "score": 0.22,
+                "source": "sdk"
+              }
+            ]
+          },
+          {
+            "trace_id": "dc32839f-0d76-5838-9fb4-5d779835735b",
+            "failed_evals": [
+              {
+                "name": "tool_compliance",
+                "score": 0.0,
+                "source": "built_in"
+              },
+              {
+                "name": "tool:compare_competitors",
+                "score": 0.15,
+                "source": "compat_engine"
+              }
+            ]
+          },
+          {
+            "trace_id": "0e452cd9-0c50-551f-b73e-b1c5aa265763",
+            "failed_evals": [
+              {
+                "name": "tool_compliance",
+                "score": 0.0,
+                "source": "built_in"
+              },
+              {
+                "name": "tool:compare_competitors",
+                "score": 0.15,
+                "source": "compat_engine"
+              }
+            ]
+          },
+          {
+            "trace_id": "3aa817a2-fb82-51b7-98d6-c6d7bf597c84",
+            "failed_evals": [
+              {
+                "name": "prompt:system_prompt",
+                "score": 0.2,
+                "source": "compat_engine"
+              }
+            ]
+          },
+          {
+            "trace_id": "cffe0827-747a-5019-ad7d-da2e78336f4c",
+            "failed_evals": [
+              {
+                "name": "prompt:system_prompt",
+                "score": 0.2,
+                "source": "compat_engine"
+              }
+            ]
+          }
+        ],
+        "top_failing_evals": [
+          {
+            "name": "tool_compliance",
+            "fail_count": 2,
+            "avg_score": 0.0
+          },
+          {
+            "name": "tool:compare_competitors",
+            "fail_count": 2,
+            "avg_score": 0.15
+          },
+          {
+            "name": "prompt:system_prompt",
+            "fail_count": 2,
+            "avg_score": 0.2
+          },
+          {
+            "name": "completion",
+            "fail_count": 1,
+            "avg_score": 0.0
+          },
+          {
+            "name": "quality",
+            "fail_count": 1,
+            "avg_score": 0.22
+          }
+        ]
+      }
+    },
+    {
+      "id": "63a88eb4-5f36-48e7-b60f-648eab0dbd19",
+      "surface_change_type": "prompt_section_rewritten",
+      "surface_name": "system_prompt",
+      "severity": "medium",
+      "affected_trace_count": 120,
+      "sample_trace_ids": [
+        "75734f85-7546-5cbe-a39f-418c6f8d21dd",
+        "766e63d8-8fdf-5112-a10d-8b9f0891e567",
+        "60200eff-0ae6-573b-ae1d-d189694d096c",
+        "d49c18c6-183f-5372-9a45-9019799d0deb",
+        "3c86b73f-49ff-590e-b2ae-ac942e87a1b6"
+      ],
+      "explanation": "Prompt section `system_prompt` major (88.6% changed). 120 traces in the last window may produce differently-worded outputs. Behavioral verification is needed to confirm direction.",
+      "eval_breakdown": {
+        "passing_affected": 15,
+        "failing_affected": 5,
+        "unscored_affected": 100,
+        "sample_passing_trace_ids": [
+          "766e63d8-8fdf-5112-a10d-8b9f0891e567",
+          "60200eff-0ae6-573b-ae1d-d189694d096c",
+          "d49c18c6-183f-5372-9a45-9019799d0deb",
+          "3c86b73f-49ff-590e-b2ae-ac942e87a1b6",
+          "988dea1d-0ec3-50d9-93dd-418cda477be2"
+        ],
+        "sample_failing_trace_ids": [
+          "75734f85-7546-5cbe-a39f-418c6f8d21dd",
+          "dc32839f-0d76-5838-9fb4-5d779835735b",
+          "0e452cd9-0c50-551f-b73e-b1c5aa265763",
+          "3aa817a2-fb82-51b7-98d6-c6d7bf597c84",
+          "cffe0827-747a-5019-ad7d-da2e78336f4c"
+        ],
+        "sample_unscored_trace_ids": [
+          "3295775d-e720-4882-8cfe-3205513a3164",
+          "3008856a-cbb7-4db1-849b-e1e5dd2af46c",
+          "f0e87139-92ac-4335-bb8c-d6fc604b3810",
+          "ad33930c-0ba4-4192-ba7e-9e5a7c240258",
+          "c38c756e-91c0-4cc1-800c-35625705c70e"
+        ],
+        "failing_eval_details": [
+          {
+            "trace_id": "75734f85-7546-5cbe-a39f-418c6f8d21dd",
+            "failed_evals": [
+              {
+                "name": "completion",
+                "score": 0.0,
+                "source": "built_in"
+              },
+              {
+                "name": "quality",
+                "score": 0.22,
+                "source": "sdk"
+              }
+            ]
+          },
+          {
+            "trace_id": "dc32839f-0d76-5838-9fb4-5d779835735b",
+            "failed_evals": [
+              {
+                "name": "tool_compliance",
+                "score": 0.0,
+                "source": "built_in"
+              },
+              {
+                "name": "tool:compare_competitors",
+                "score": 0.15,
+                "source": "compat_engine"
+              }
+            ]
+          },
+          {
+            "trace_id": "0e452cd9-0c50-551f-b73e-b1c5aa265763",
+            "failed_evals": [
+              {
+                "name": "tool_compliance",
+                "score": 0.0,
+                "source": "built_in"
+              },
+              {
+                "name": "tool:compare_competitors",
+                "score": 0.15,
+                "source": "compat_engine"
+              }
+            ]
+          },
+          {
+            "trace_id": "3aa817a2-fb82-51b7-98d6-c6d7bf597c84",
+            "failed_evals": [
+              {
+                "name": "prompt:system_prompt",
+                "score": 0.2,
+                "source": "compat_engine"
+              }
+            ]
+          },
+          {
+            "trace_id": "cffe0827-747a-5019-ad7d-da2e78336f4c",
+            "failed_evals": [
+              {
+                "name": "prompt:system_prompt",
+                "score": 0.2,
+                "source": "compat_engine"
+              }
+            ]
+          }
+        ],
+        "top_failing_evals": [
+          {
+            "name": "tool_compliance",
+            "fail_count": 2,
+            "avg_score": 0.0
+          },
+          {
+            "name": "tool:compare_competitors",
+            "fail_count": 2,
+            "avg_score": 0.15
+          },
+          {
+            "name": "prompt:system_prompt",
+            "fail_count": 2,
+            "avg_score": 0.2
+          },
+          {
+            "name": "completion",
+            "fail_count": 1,
+            "avg_score": 0.0
+          },
+          {
+            "name": "quality",
+            "fail_count": 1,
+            "avg_score": 0.22
+          }
+        ]
+      }
+    },
+    {
+      "id": "dd2463c8-05b2-40e3-b94c-304da1ba7d23",
+      "surface_change_type": "tool_schema_optional_param_added",
+      "surface_name": "check_inventory",
+      "severity": "low",
+      "affected_trace_count": 3,
+      "sample_trace_ids": [
+        "d5fdad52-8c31-5269-8596-cc9d9c48d105",
+        "a4a81636-6e33-503f-b12b-34ca077081e7",
+        "0b7a5c12-1346-5dd0-8cae-65eb726b9110"
+      ],
+      "explanation": "3 traces called `check_inventory`. The new optional parameter will use its default value for these calls (low risk).",
+      "eval_breakdown": {
+        "passing_affected": 3,
+        "failing_affected": 0,
+        "unscored_affected": 0,
+        "sample_passing_trace_ids": [
+          "d5fdad52-8c31-5269-8596-cc9d9c48d105",
+          "a4a81636-6e33-503f-b12b-34ca077081e7",
+          "0b7a5c12-1346-5dd0-8cae-65eb726b9110"
+        ],
+        "sample_failing_trace_ids": [],
+        "sample_unscored_trace_ids": [],
+        "failing_eval_details": [],
+        "top_failing_evals": []
+      }
+    },
+    {
+      "id": "677987f3-ff85-4283-bfef-713a0bca5f4e",
+      "surface_change_type": "tool_added",
+      "surface_name": "refund_order",
+      "severity": "low",
+      "affected_trace_count": 0,
+      "sample_trace_ids": [],
+      "explanation": "New tool `refund_order` added — no historical traces affected.",
+      "eval_breakdown": {
+        "passing_affected": 0,
+        "failing_affected": 0,
+        "unscored_affected": 0,
+        "sample_passing_trace_ids": [],
+        "sample_failing_trace_ids": [],
+        "sample_unscored_trace_ids": [],
+        "failing_eval_details": [],
+        "top_failing_evals": []
+      }
+    },
+    {
+      "id": "6a9b938d-0d35-4464-ae52-9c0f588932f9",
+      "surface_change_type": "tool_removed",
+      "surface_name": "compare_competitors",
+      "severity": "high",
+      "affected_trace_count": 2,
+      "sample_trace_ids": [
+        "0e452cd9-0c50-551f-b73e-b1c5aa265763",
+        "dc32839f-0d76-5838-9fb4-5d779835735b"
+      ],
+      "explanation": "2 traces called the removed `compare_competitors` tool. These will error or fall back when this change ships.",
+      "eval_breakdown": {
+        "passing_affected": 0,
+        "failing_affected": 2,
+        "unscored_affected": 0,
+        "sample_passing_trace_ids": [],
+        "sample_failing_trace_ids": [
+          "0e452cd9-0c50-551f-b73e-b1c5aa265763",
+          "dc32839f-0d76-5838-9fb4-5d779835735b"
+        ],
+        "sample_unscored_trace_ids": [],
+        "failing_eval_details": [
+          {
+            "trace_id": "0e452cd9-0c50-551f-b73e-b1c5aa265763",
+            "failed_evals": [
+              {
+                "name": "tool_compliance",
+                "score": 0.0,
+                "source": "built_in"
+              },
+              {
+                "name": "tool:compare_competitors",
+                "score": 0.15,
+                "source": "compat_engine"
+              }
+            ]
+          },
+          {
+            "trace_id": "dc32839f-0d76-5838-9fb4-5d779835735b",
+            "failed_evals": [
+              {
+                "name": "tool_compliance",
+                "score": 0.0,
+                "source": "built_in"
+              },
+              {
+                "name": "tool:compare_competitors",
+                "score": 0.15,
+                "source": "compat_engine"
+              }
+            ]
+          }
+        ],
+        "top_failing_evals": [
+          {
+            "name": "tool_compliance",
+            "fail_count": 2,
+            "avg_score": 0.0
+          },
+          {
+            "name": "tool:compare_competitors",
+            "fail_count": 2,
+            "avg_score": 0.15
+          }
+        ]
+      }
+    }
+  ]
+}

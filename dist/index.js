@@ -35799,6 +35799,7 @@ exports.formatUnavailableComment = formatUnavailableComment;
 exports.upsertPrComment = upsertPrComment;
 const github = __importStar(__nccwpck_require__(3228));
 const api_1 = __nccwpck_require__(6879);
+const fixture_1 = __nccwpck_require__(9865);
 /** Hidden marker for finding our existing comment on update mode. */
 const MARKER = '<!-- decimalai-regression-check-comment -->';
 // Attribution, and a way home. This comment renders in other people's pull
@@ -36052,9 +36053,16 @@ function formatBehavioralNudge(report) {
         '',
     ];
 }
-function formatComment(report, baseUrl, callReplay) {
+function formatComment(report, baseUrl, callReplay, opts) {
     const lines = [];
     lines.push(MARKER);
+    // Fixture mode: the very next line says this is sample data, above the heading, so no
+    // reader can scroll past it to a red verdict. MARKER stays first — update mode finds
+    // the existing comment by it.
+    if (opts?.fixture) {
+        lines.push(fixture_1.FIXTURE_BANNER);
+        lines.push('');
+    }
     lines.push(`### 🔍 Agent Regression Check — \`${mdCode(report.agent_name)}\``);
     lines.push('');
     // `human_summary` — the same one-line callout that appears on the
@@ -36273,9 +36281,15 @@ function formatComment(report, baseUrl, callReplay) {
             lines.push('');
         }
     }
-    // Report link
-    const reportUrl = (0, api_1.buildReportUrl)(baseUrl, report.agent_name, report.id);
-    lines.push(`[View full report →](${reportUrl})`);
+    // Report link. A fixture has no report on the dashboard — the link would 404 — so it
+    // points at the demo the fixture was captured from.
+    if (opts?.fixture) {
+        lines.push(`[See this on a real agent — two-minute demo →](${fixture_1.FIXTURE_DOCS_URL})`);
+    }
+    else {
+        const reportUrl = (0, api_1.buildReportUrl)(baseUrl, report.agent_name, report.id);
+        lines.push(`[View full report →](${reportUrl})`);
+    }
     lines.push(FOOTER);
     return lines.join('\n');
 }
@@ -36395,6 +36409,66 @@ async function findExistingComments(octokit, owner, repo, prNumber) {
 
 /***/ }),
 
+/***/ 9865:
+/***/ (function(__unused_webpack_module, exports, __nccwpck_require__) {
+
+"use strict";
+
+/**
+ * Fixture mode — what the Action renders when no `api-key` is supplied.
+ *
+ * Until 2026-09-13 `api-key` was required, so a reader could not see this Action's output
+ * without creating an account first — against HN's "try it without signup" guideline,
+ * console.dev's self-service criterion, and the awesome-list review rule that names
+ * "requires any form of signup" as a blocker. In fixture mode the Action skips the API
+ * entirely, renders the committed report below (the two-minute demo's seeded agent,
+ * captured from a real run), posts the same comment a live run would post with a banner
+ * as its first line, and never fails the job. Add an `api-key` and the same workflow
+ * runs against the agent's real traces.
+ *
+ * Rendering is a pure function of the report (comment.ts), which is why this is a
+ * substitution of the report object and nothing more.
+ */
+var __importDefault = (this && this.__importDefault) || function (mod) {
+    return (mod && mod.__esModule) ? mod : { "default": mod };
+};
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.FIXTURE_BANNER = exports.FIXTURE_REPORT = exports.FIXTURE_SIGNUP_URL = exports.FIXTURE_DOCS_URL = void 0;
+exports.fixtureReport = fixtureReport;
+const impact_report_json_1 = __importDefault(__nccwpck_require__(8702));
+exports.FIXTURE_DOCS_URL = 'https://docs.decimal.ai/tutorials/two-minute-demo';
+exports.FIXTURE_SIGNUP_URL = 'https://app.decimal.ai/settings';
+/** The captured report, typed. The JSON's `_README` is documentation and is dropped here. */
+const { _README: _doc, ...captured } = impact_report_json_1.default;
+void _doc;
+exports.FIXTURE_REPORT = captured;
+/**
+ * A fresh copy of the fixture report. When the caller passed an `agent-name` it is used
+ * as the label, so the comment reads as theirs; the data underneath is still the demo's,
+ * and the banner says so.
+ */
+function fixtureReport(agentName) {
+    const r = JSON.parse(JSON.stringify(exports.FIXTURE_REPORT));
+    if (agentName)
+        r.agent_name = agentName;
+    return r;
+}
+/**
+ * The first human-readable line of a fixture-mode comment (the hidden MARKER stays line 1
+ * — comment.ts anchors comment updates on it). "Fixture" and "not your traffic" sit in the
+ * first six words, before any truncation in a notification email; the remedy is the literal
+ * YAML line to paste. Plain markdown, no HTML: comment_injection.test.ts forbids raw HTML
+ * anywhere in the body, and the invariant is worth more than a small-text tag.
+ */
+exports.FIXTURE_BANNER = '> **Fixture run — sample data, not your traffic.** No `api-key` was supplied, so this ' +
+    'report was rendered from a committed public fixture: the seeded demo agent from the ' +
+    `[two-minute demo](${exports.FIXTURE_DOCS_URL}). Add \`api-key: \${{ secrets.DECIMAL_API_KEY }}\` ` +
+    `(free key at [app.decimal.ai/settings](${exports.FIXTURE_SIGNUP_URL})) to run it against your own ` +
+    'production traces.';
+
+
+/***/ }),
+
 /***/ 9407:
 /***/ (function(__unused_webpack_module, exports, __nccwpck_require__) {
 
@@ -36404,7 +36478,7 @@ async function findExistingComments(octokit, owner, repo, prNumber) {
  * Decimal regression-check Action — main entry point.
  *
  * Flow:
- *   1. Parse inputs
+ *   1. Parse inputs (no api-key → fixture mode: steps 2–4 are replaced by the committed report)
  *   2. Resolve candidate manifest ID (from input or $GITHUB_OUTPUT or local file)
  *   3. Build PR context from github.context
  *   4. POST /api/v1/regression-check
@@ -36454,6 +36528,7 @@ const github = __importStar(__nccwpck_require__(3228));
 const api_1 = __nccwpck_require__(6879);
 const comment_1 = __nccwpck_require__(2246);
 const inputs_1 = __nccwpck_require__(8422);
+const fixture_1 = __nccwpck_require__(9865);
 const VERDICT_RANK = {
     no_change: 0,
     first_run: 0,
@@ -36522,69 +36597,83 @@ async function main() {
         core.setFailed(`Input error: ${e.message}`);
         return;
     }
-    core.info(`Running regression check for agent='${inputs.agentName}' candidate='${inputs.candidateManifestId}'`);
     const githubTokenForComment = inputs.githubToken;
     if (githubTokenForComment)
         core.setSecret(githubTokenForComment); // mask the token in Action logs
     let report;
-    try {
-        report = await (0, api_1.runRegressionCheck)({
-            baseUrl: inputs.baseUrl,
-            apiKey: inputs.apiKey,
-            agentName: inputs.agentName,
-            candidateManifestId: inputs.candidateManifestId,
-            prContext: buildPrContext(),
-            traceWindowDays: inputs.traceWindowDays,
-        });
+    let callReplay;
+    if (inputs.fixtureMode) {
+        // No api-key: render the committed fixture and never touch the network. The
+        // comment's first line and this notice both say so; the job cannot fail on it.
+        core.notice('Fixture run: no api-key was supplied, so this report is rendered from a committed ' +
+            'public fixture (the seeded demo agent), not from your traffic. Add api-key to check ' +
+            'your own agent.');
+        report = (0, fixture_1.fixtureReport)(inputs.agentName || undefined);
     }
-    catch (e) {
-        const reason = e.message;
-        // A transient failure to RUN the check — a 5xx, a network blip, a
-        // rate-limit 429 — is not a regression in the caller's code. Under
-        // `on-error: warn` it must leave the job green and report `unavailable`;
-        // only a verdict the server actually returned may reach shouldFail(), so
-        // `fail-on: none` stays advisory.
-        if ((0, api_1.isTransientApiFailure)(e) && inputs.onError === 'warn') {
-            core.warning(`Agent Regression Check unavailable — ${reason}`);
-            // Outputs still get set so downstream steps branch on a real value
-            // rather than an empty string.
-            core.setOutput('verdict', 'unavailable');
-            core.setOutput('high-risk-count', '0');
-            core.setOutput('medium-risk-count', '0');
-            core.setOutput('low-risk-count', '0');
-            if (githubTokenForComment) {
-                try {
-                    await (0, comment_1.upsertPrComment)({
-                        githubToken: githubTokenForComment,
-                        body: (0, comment_1.formatUnavailableComment)(inputs.agentName, reason),
-                        mode: inputs.commentMode,
-                    });
-                }
-                catch (commentErr) {
-                    core.warning(`Failed to upsert PR comment: ${commentErr.message}`);
-                }
-            }
-            return; // exit 0 — advisory, per on-error: warn
+    else {
+        core.info(`Running regression check for agent='${inputs.agentName}' candidate='${inputs.candidateManifestId}'`);
+        try {
+            report = await (0, api_1.runRegressionCheck)({
+                baseUrl: inputs.baseUrl,
+                apiKey: inputs.apiKey,
+                agentName: inputs.agentName,
+                candidateManifestId: inputs.candidateManifestId,
+                prContext: buildPrContext(),
+                traceWindowDays: inputs.traceWindowDays,
+            });
         }
-        core.setFailed(`Regression check failed: ${reason}`);
-        return;
+        catch (e) {
+            const reason = e.message;
+            // A transient failure to RUN the check — a 5xx, a network blip, a
+            // rate-limit 429 — is not a regression in the caller's code. Under
+            // `on-error: warn` it must leave the job green and report `unavailable`;
+            // only a verdict the server actually returned may reach shouldFail(), so
+            // `fail-on: none` stays advisory.
+            if ((0, api_1.isTransientApiFailure)(e) && inputs.onError === 'warn') {
+                core.warning(`Agent Regression Check unavailable — ${reason}`);
+                // Outputs still get set so downstream steps branch on a real value
+                // rather than an empty string.
+                core.setOutput('mode', 'live');
+                core.setOutput('verdict', 'unavailable');
+                core.setOutput('high-risk-count', '0');
+                core.setOutput('medium-risk-count', '0');
+                core.setOutput('low-risk-count', '0');
+                if (githubTokenForComment) {
+                    try {
+                        await (0, comment_1.upsertPrComment)({
+                            githubToken: githubTokenForComment,
+                            body: (0, comment_1.formatUnavailableComment)(inputs.agentName, reason),
+                            mode: inputs.commentMode,
+                        });
+                    }
+                    catch (commentErr) {
+                        core.warning(`Failed to upsert PR comment: ${commentErr.message}`);
+                    }
+                }
+                return; // exit 0 — advisory, per on-error: warn
+            }
+            core.setFailed(`Regression check failed: ${reason}`);
+            return;
+        }
     }
     // Set outputs
+    core.setOutput('mode', inputs.fixtureMode ? 'fixture' : 'live');
     core.setOutput('verdict', report.verdict);
     core.setOutput('high-risk-count', String(report.high_risk_count));
     core.setOutput('medium-risk-count', String(report.medium_risk_count));
     core.setOutput('low-risk-count', String(report.low_risk_count));
     core.setOutput('regression-check-id', report.id);
-    core.setOutput('report-url', (0, api_1.buildReportUrl)(inputs.baseUrl, inputs.agentName, report.id));
+    core.setOutput('report-url', inputs.fixtureMode ? fixture_1.FIXTURE_DOCS_URL : (0, api_1.buildReportUrl)(inputs.baseUrl, inputs.agentName, report.id));
     // Log a summary regardless of PR context
     core.info(`Verdict: ${report.verdict.toUpperCase()} | ` +
-        `HIGH=${report.high_risk_count} MEDIUM=${report.medium_risk_count} LOW=${report.low_risk_count}`);
+        `HIGH=${report.high_risk_count} MEDIUM=${report.medium_risk_count} LOW=${report.low_risk_count}` +
+        (inputs.fixtureMode ? ' (fixture)' : ''));
     core.info(report.verdict_message);
     // Behavioral verification (opt-in). Re-issues recorded model calls against
     // the candidate model when behavioral-check != off AND the diff has a model
-    // change. Informational only — never fails the action.
-    let callReplay;
-    if (inputs.behavioralCheck !== 'off') {
+    // change. Informational only — never fails the action. Not in fixture mode:
+    // there is no run on the server to replay.
+    if (!inputs.fixtureMode && inputs.behavioralCheck !== 'off') {
         const hasModelChange = (report.diff_summary?.changes || []).some((c) => c.type === 'model_changed');
         if (hasModelChange) {
             try {
@@ -36616,7 +36705,7 @@ async function main() {
         try {
             await (0, comment_1.upsertPrComment)({
                 githubToken,
-                body: (0, comment_1.formatComment)(report, inputs.baseUrl, callReplay),
+                body: (0, comment_1.formatComment)(report, inputs.baseUrl, callReplay, { fixture: inputs.fixtureMode }),
                 mode: inputs.commentMode,
             });
         }
@@ -36629,8 +36718,9 @@ async function main() {
     else {
         core.info('GITHUB_TOKEN not present — skipping PR comment post.');
     }
-    // Exit code per fail-on policy
-    if (shouldFail(report.verdict, inputs.failOn, report.structural_severity)) {
+    // Exit code per fail-on policy. Never in fixture mode: the fixture's verdict is
+    // high_risk by design, and a demo must not red a stranger's pull request.
+    if (!inputs.fixtureMode && shouldFail(report.verdict, inputs.failOn, report.structural_severity)) {
         core.setFailed(`Verdict '${report.verdict}' meets fail-on threshold '${inputs.failOn}'. ${report.verdict_message}`);
     }
 }
@@ -36700,14 +36790,19 @@ const COMMENT_MODE_VALUES = ['update', 'new'];
 const BEHAVIORAL_CHECK_VALUES = ['off', 'mock', 'real'];
 const ON_ERROR_VALUES = ['warn', 'fail'];
 function parseInputs() {
-    const apiKey = core.getInput('api-key', { required: true });
+    // Optional since 1.2.0: absent means fixture mode. Decided FIRST, because the two
+    // required-input checks below are conditional on it.
+    const apiKey = core.getInput('api-key');
+    const fixtureMode = !apiKey;
     // Register the key for log masking regardless of how the
     // caller supplied it — values from vars.*/matrix/literals are NOT auto-masked like
     // secrets.* are, so without this an error body or future log line could print it in
     // plaintext in the (publicly readable, ~90-day) Action log.
     if (apiKey)
         core.setSecret(apiKey);
-    const agentName = core.getInput('agent-name', { required: true });
+    // Still required for a live run: without it there is no agent to check. The fixture
+    // carries its own name, so in fixture mode it is only a label.
+    const agentName = fixtureMode ? core.getInput('agent-name') : core.getInput('agent-name', { required: true });
     const failOnRaw = (core.getInput('fail-on') || 'high').toLowerCase();
     if (!FAIL_ON_VALUES.includes(failOnRaw)) {
         throw new Error(`Invalid fail-on value '${failOnRaw}'. Must be one of: ${FAIL_ON_VALUES.join(', ')}`);
@@ -36729,8 +36824,9 @@ function parseInputs() {
         throw new Error(`Invalid trace-window-days '${traceWindowDaysRaw}'. Must be 365 or fewer.`);
     }
     const explicitId = core.getInput('candidate-manifest-id');
-    const candidateManifestId = explicitId || resolveCandidateManifestId();
-    if (!candidateManifestId) {
+    // Fixture mode has no manifest to resolve; a live run must find one or stop loudly.
+    const candidateManifestId = fixtureMode ? explicitId : explicitId || resolveCandidateManifestId();
+    if (!fixtureMode && !candidateManifestId) {
         throw new Error('No candidate-manifest-id provided or discoverable. ' +
             'Either pass it explicitly or run decimalai.flush_manifest_for_ci() ' +
             'in a prior step to write decimal_manifest_id to $GITHUB_OUTPUT.');
@@ -36768,6 +36864,7 @@ function parseInputs() {
         behavioralCheck: behavioralRaw,
         onError: onErrorRaw,
         githubToken,
+        fixtureMode,
     };
 }
 /**
@@ -37073,6 +37170,14 @@ module.exports = require("tls");
 
 "use strict";
 module.exports = require("util");
+
+/***/ }),
+
+/***/ 8702:
+/***/ ((module) => {
+
+"use strict";
+module.exports = /*#__PURE__*/JSON.parse('{"_README":"The report the Action renders in FIXTURE MODE (no api-key). Captured 2026-09-13 from a local backend after `decimalai demo regression`, which seeds the two-minute demo\'s `[Demo] support-agent` (v1 -> v2: get_pricing renamed to lookup_price, compare_competitors removed, refund_order added, check_inventory gains an optional param, the system prompt rewritten, the model snapshot bumped) with 120 traces and runs the production regression check over them: 2 high / 118 medium / 0 low. Ids, hashes, timestamps and pr_context are placeholders; every other field is the backend\'s own answer. Regenerate: run a backend, `DECIMAL_API_KEY=<key> decimalai demo regression --base-url <url>`, then GET /api/v1/regression-check/{id} with the same key and re-apply the placeholders. The numbers must match docs.decimal.ai/tutorials/two-minute-demo and the README image, so the Action, the CLI demo and the docs tell one story.","id":"fixture-demo-support-agent","agent_name":"[Demo] support-agent","baseline_manifest_id":"fixture-manifest-v1","candidate_manifest_id":"fixture-manifest-v2","status":"completed","verdict":"high_risk","verdict_message":"2 traces will break. Review before merging. (also: 118 medium-risk affected)","structural_severity":"high","human_summary":"Renamed `get_pricing` → `lookup_price`, added tool `refund_order`, removed tool `compare_competitors`, changed `check_inventory` schema… +more changes.","high_risk_count":2,"medium_risk_count":118,"low_risk_count":0,"total_traces_analyzed":120,"diff_summary":{"total_changes":6,"high_severity_changes":1,"medium_severity_changes":3,"low_severity_changes":2,"changes":[{"type":"tool_renamed","name":"lookup_price","severity":"medium","detail":{"old_name":"get_pricing","new_name":"lookup_price","content_hash":"d57677263d45eed7"}},{"type":"model_changed","name":"gpt-4o-mini","severity":"medium","detail":{"severity":"moderate","change_type":"version_bump","old_model":"gpt-4o-mini-2024-07-18","new_model":"gpt-4o-mini-2024-09-12","grade":"moderate","change_kind":"version_bump","policy":{"name":"default","disposition":"flag","implies":"warn"}}},{"type":"prompt_section_rewritten","name":"system_prompt","severity":"medium","detail":{"diff_pct":88.6,"severity":"major","grade":"major","change_kind":"prompt_major","policy":{"name":"default","disposition":"replay","implies":"warn"}}},{"type":"tool_schema_optional_param_added","name":"check_inventory","severity":"low","detail":{"params":["region"]}},{"type":"tool_added","name":"refund_order","severity":"low","detail":{}},{"type":"tool_removed","name":"compare_competitors","severity":"high","detail":{}}]},"pr_context":null,"error_message":null,"created_at":"2026-09-13T00:00:00Z","eval_verdict":"regression_likely","eval_breakdown":{"passing_affected":15,"failing_affected":5,"unscored_affected":100,"eval_capped":false},"downstream_impact":{"evaluators":{"stale_count":0,"sample_evaluator_names":[],"surfaces_causing_staleness":["tool_removed: high","tool_renamed: medium","model_changed: medium"]},"datasets":{"affected_dataset_version_count":1,"sample_dataset_names":["[Demo] support-agent SFT set"],"total_rows_invalidated":10},"subagents":{"broken_handoffs":[]},"skills":{"affected_agent_count":0,"sample_agent_names":[],"skills_changed":[]}},"call_replay":null,"source":"fixture","baseline_manifest_label":"v1","baseline_manifest_hash":"000000000000","candidate_manifest_label":"v2","candidate_manifest_hash":"000000000000","human_decision":null,"impacts":[{"id":"ddbd5bcb-dc3a-4aeb-aa4c-f767df5895cd","surface_change_type":"tool_renamed","surface_name":"lookup_price","severity":"medium","affected_trace_count":1,"sample_trace_ids":["75d27b98-4f71-56b0-9dcb-a00089c47aa6"],"explanation":"1 traces called `get_pricing` (now renamed to `lookup_price`). Runtime resolution by content_hash will keep working, but hard-coded references to the old name in eval rules, telemetry filters, or downstream code will need updating.","eval_breakdown":{"passing_affected":1,"failing_affected":0,"unscored_affected":0,"sample_passing_trace_ids":["75d27b98-4f71-56b0-9dcb-a00089c47aa6"],"sample_failing_trace_ids":[],"sample_unscored_trace_ids":[],"failing_eval_details":[],"top_failing_evals":[]}},{"id":"c3a10643-d734-4919-b1cc-de186668145a","surface_change_type":"model_changed","surface_name":"gpt-4o-mini","severity":"medium","affected_trace_count":120,"sample_trace_ids":["75734f85-7546-5cbe-a39f-418c6f8d21dd","766e63d8-8fdf-5112-a10d-8b9f0891e567","60200eff-0ae6-573b-ae1d-d189694d096c","d49c18c6-183f-5372-9a45-9019799d0deb","3c86b73f-49ff-590e-b2ae-ac942e87a1b6"],"explanation":"Model version bump (gpt-4o-mini-2024-07-18 → gpt-4o-mini-2024-09-12) — moderate. All 120 traces in the window will use the new model. Behavioral direction can\'t be predicted structurally — use post-deploy bisect (CUJ 11) to verify actual impact.","eval_breakdown":{"passing_affected":15,"failing_affected":5,"unscored_affected":100,"sample_passing_trace_ids":["766e63d8-8fdf-5112-a10d-8b9f0891e567","60200eff-0ae6-573b-ae1d-d189694d096c","d49c18c6-183f-5372-9a45-9019799d0deb","3c86b73f-49ff-590e-b2ae-ac942e87a1b6","988dea1d-0ec3-50d9-93dd-418cda477be2"],"sample_failing_trace_ids":["75734f85-7546-5cbe-a39f-418c6f8d21dd","dc32839f-0d76-5838-9fb4-5d779835735b","0e452cd9-0c50-551f-b73e-b1c5aa265763","3aa817a2-fb82-51b7-98d6-c6d7bf597c84","cffe0827-747a-5019-ad7d-da2e78336f4c"],"sample_unscored_trace_ids":["3295775d-e720-4882-8cfe-3205513a3164","3008856a-cbb7-4db1-849b-e1e5dd2af46c","f0e87139-92ac-4335-bb8c-d6fc604b3810","ad33930c-0ba4-4192-ba7e-9e5a7c240258","c38c756e-91c0-4cc1-800c-35625705c70e"],"failing_eval_details":[{"trace_id":"75734f85-7546-5cbe-a39f-418c6f8d21dd","failed_evals":[{"name":"completion","score":0,"source":"built_in"},{"name":"quality","score":0.22,"source":"sdk"}]},{"trace_id":"dc32839f-0d76-5838-9fb4-5d779835735b","failed_evals":[{"name":"tool_compliance","score":0,"source":"built_in"},{"name":"tool:compare_competitors","score":0.15,"source":"compat_engine"}]},{"trace_id":"0e452cd9-0c50-551f-b73e-b1c5aa265763","failed_evals":[{"name":"tool_compliance","score":0,"source":"built_in"},{"name":"tool:compare_competitors","score":0.15,"source":"compat_engine"}]},{"trace_id":"3aa817a2-fb82-51b7-98d6-c6d7bf597c84","failed_evals":[{"name":"prompt:system_prompt","score":0.2,"source":"compat_engine"}]},{"trace_id":"cffe0827-747a-5019-ad7d-da2e78336f4c","failed_evals":[{"name":"prompt:system_prompt","score":0.2,"source":"compat_engine"}]}],"top_failing_evals":[{"name":"tool_compliance","fail_count":2,"avg_score":0},{"name":"tool:compare_competitors","fail_count":2,"avg_score":0.15},{"name":"prompt:system_prompt","fail_count":2,"avg_score":0.2},{"name":"completion","fail_count":1,"avg_score":0},{"name":"quality","fail_count":1,"avg_score":0.22}]}},{"id":"63a88eb4-5f36-48e7-b60f-648eab0dbd19","surface_change_type":"prompt_section_rewritten","surface_name":"system_prompt","severity":"medium","affected_trace_count":120,"sample_trace_ids":["75734f85-7546-5cbe-a39f-418c6f8d21dd","766e63d8-8fdf-5112-a10d-8b9f0891e567","60200eff-0ae6-573b-ae1d-d189694d096c","d49c18c6-183f-5372-9a45-9019799d0deb","3c86b73f-49ff-590e-b2ae-ac942e87a1b6"],"explanation":"Prompt section `system_prompt` major (88.6% changed). 120 traces in the last window may produce differently-worded outputs. Behavioral verification is needed to confirm direction.","eval_breakdown":{"passing_affected":15,"failing_affected":5,"unscored_affected":100,"sample_passing_trace_ids":["766e63d8-8fdf-5112-a10d-8b9f0891e567","60200eff-0ae6-573b-ae1d-d189694d096c","d49c18c6-183f-5372-9a45-9019799d0deb","3c86b73f-49ff-590e-b2ae-ac942e87a1b6","988dea1d-0ec3-50d9-93dd-418cda477be2"],"sample_failing_trace_ids":["75734f85-7546-5cbe-a39f-418c6f8d21dd","dc32839f-0d76-5838-9fb4-5d779835735b","0e452cd9-0c50-551f-b73e-b1c5aa265763","3aa817a2-fb82-51b7-98d6-c6d7bf597c84","cffe0827-747a-5019-ad7d-da2e78336f4c"],"sample_unscored_trace_ids":["3295775d-e720-4882-8cfe-3205513a3164","3008856a-cbb7-4db1-849b-e1e5dd2af46c","f0e87139-92ac-4335-bb8c-d6fc604b3810","ad33930c-0ba4-4192-ba7e-9e5a7c240258","c38c756e-91c0-4cc1-800c-35625705c70e"],"failing_eval_details":[{"trace_id":"75734f85-7546-5cbe-a39f-418c6f8d21dd","failed_evals":[{"name":"completion","score":0,"source":"built_in"},{"name":"quality","score":0.22,"source":"sdk"}]},{"trace_id":"dc32839f-0d76-5838-9fb4-5d779835735b","failed_evals":[{"name":"tool_compliance","score":0,"source":"built_in"},{"name":"tool:compare_competitors","score":0.15,"source":"compat_engine"}]},{"trace_id":"0e452cd9-0c50-551f-b73e-b1c5aa265763","failed_evals":[{"name":"tool_compliance","score":0,"source":"built_in"},{"name":"tool:compare_competitors","score":0.15,"source":"compat_engine"}]},{"trace_id":"3aa817a2-fb82-51b7-98d6-c6d7bf597c84","failed_evals":[{"name":"prompt:system_prompt","score":0.2,"source":"compat_engine"}]},{"trace_id":"cffe0827-747a-5019-ad7d-da2e78336f4c","failed_evals":[{"name":"prompt:system_prompt","score":0.2,"source":"compat_engine"}]}],"top_failing_evals":[{"name":"tool_compliance","fail_count":2,"avg_score":0},{"name":"tool:compare_competitors","fail_count":2,"avg_score":0.15},{"name":"prompt:system_prompt","fail_count":2,"avg_score":0.2},{"name":"completion","fail_count":1,"avg_score":0},{"name":"quality","fail_count":1,"avg_score":0.22}]}},{"id":"dd2463c8-05b2-40e3-b94c-304da1ba7d23","surface_change_type":"tool_schema_optional_param_added","surface_name":"check_inventory","severity":"low","affected_trace_count":3,"sample_trace_ids":["d5fdad52-8c31-5269-8596-cc9d9c48d105","a4a81636-6e33-503f-b12b-34ca077081e7","0b7a5c12-1346-5dd0-8cae-65eb726b9110"],"explanation":"3 traces called `check_inventory`. The new optional parameter will use its default value for these calls (low risk).","eval_breakdown":{"passing_affected":3,"failing_affected":0,"unscored_affected":0,"sample_passing_trace_ids":["d5fdad52-8c31-5269-8596-cc9d9c48d105","a4a81636-6e33-503f-b12b-34ca077081e7","0b7a5c12-1346-5dd0-8cae-65eb726b9110"],"sample_failing_trace_ids":[],"sample_unscored_trace_ids":[],"failing_eval_details":[],"top_failing_evals":[]}},{"id":"677987f3-ff85-4283-bfef-713a0bca5f4e","surface_change_type":"tool_added","surface_name":"refund_order","severity":"low","affected_trace_count":0,"sample_trace_ids":[],"explanation":"New tool `refund_order` added — no historical traces affected.","eval_breakdown":{"passing_affected":0,"failing_affected":0,"unscored_affected":0,"sample_passing_trace_ids":[],"sample_failing_trace_ids":[],"sample_unscored_trace_ids":[],"failing_eval_details":[],"top_failing_evals":[]}},{"id":"6a9b938d-0d35-4464-ae52-9c0f588932f9","surface_change_type":"tool_removed","surface_name":"compare_competitors","severity":"high","affected_trace_count":2,"sample_trace_ids":["0e452cd9-0c50-551f-b73e-b1c5aa265763","dc32839f-0d76-5838-9fb4-5d779835735b"],"explanation":"2 traces called the removed `compare_competitors` tool. These will error or fall back when this change ships.","eval_breakdown":{"passing_affected":0,"failing_affected":2,"unscored_affected":0,"sample_passing_trace_ids":[],"sample_failing_trace_ids":["0e452cd9-0c50-551f-b73e-b1c5aa265763","dc32839f-0d76-5838-9fb4-5d779835735b"],"sample_unscored_trace_ids":[],"failing_eval_details":[{"trace_id":"0e452cd9-0c50-551f-b73e-b1c5aa265763","failed_evals":[{"name":"tool_compliance","score":0,"source":"built_in"},{"name":"tool:compare_competitors","score":0.15,"source":"compat_engine"}]},{"trace_id":"dc32839f-0d76-5838-9fb4-5d779835735b","failed_evals":[{"name":"tool_compliance","score":0,"source":"built_in"},{"name":"tool:compare_competitors","score":0.15,"source":"compat_engine"}]}],"top_failing_evals":[{"name":"tool_compliance","fail_count":2,"avg_score":0},{"name":"tool:compare_competitors","fail_count":2,"avg_score":0.15}]}}]}');
 
 /***/ })
 
