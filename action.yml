@@ -26,9 +26,13 @@ inputs:
     default: ''
   candidate-manifest-id:
     description: |
-      Candidate manifest ID. If omitted, the action reads it from
-      $GITHUB_OUTPUT (decimal_manifest_id key, written by
-      decimalai.flush_manifest_for_ci) or ./decimal_manifest_id.txt.
+      Candidate manifest ID: the decimal_manifest_id output of the step that ran
+      decimalai.flush_manifest_for_ci(), passed from that step's
+      steps.<id>.outputs.decimal_manifest_id. If omitted, the action looks
+      in its own step's $GITHUB_OUTPUT and in ./decimal_manifest_id.txt; an
+      earlier step's $GITHUB_OUTPUT is not visible there, so in a workflow only a
+      file written with flush_manifest_for_ci(..., output_path="decimal_manifest_id.txt")
+      is found.
     required: false
     default: ''
   github-token:

@@ -46,12 +46,24 @@ That name is the `agent-name` the Action takes. [Frameworks](https://docs.decima
 
 ```python
 # scripts/init_for_decimal.py
-"""Entry point for DecimalAI manifest extraction in CI."""
+"""Registers this PR's candidate manifest for DecimalAI's regression check."""
+import decimalai
 from myapp.agent import build_agent  # your existing agent factory
 
 if __name__ == "__main__":
-    build_agent()  # SDK captures the manifest. Exits.
+    decimalai.init()  # DECIMAL_API_KEY + DECIMALAI_MODE=manifest_only, from the workflow
+    result = decimalai.flush_manifest_for_ci(
+        agent_name="support-agent",  # the Action's `agent-name`
+        chain=build_agent(),         # LangChain/LangGraph: reads its tools, prompts and models
+    )
+    print(f"Manifest registered: {result['manifest_id']}")
 ```
+
+`flush_manifest_for_ci()` is the call that uploads the candidate manifest and writes its id
+(`decimal_manifest_id`) for the next step: building the agent alone registers nothing. No LLM call
+is made under `DECIMALAI_MODE=manifest_only`. If your factory doesn't return a LangChain/LangGraph
+object, drop `chain=` and pass `tools=[...]`, `prompts={...}` and `models={...}` instead, as the
+[guide](https://docs.decimal.ai/guides/regression-check) shows.
 
 ### 3. Add the workflow
 
@@ -77,8 +89,10 @@ jobs:
         run: pip install -e .
 
       - name: Manifest extraction
+        id: manifest        # required: the next step reads this step's output
         env:
           DECIMALAI_MODE: manifest_only
+          PYTHONPATH: .     # `python scripts/x.py` puts scripts/ on sys.path, not the repo root
           DECIMAL_API_KEY: ${{ secrets.DECIMAL_API_KEY }}
           OPENAI_API_KEY: dummy   # placeholder, never called in manifest_only mode
         run: python scripts/init_for_decimal.py
@@ -88,7 +102,12 @@ jobs:
         with:
           api-key: ${{ secrets.DECIMAL_API_KEY }}
           agent-name: support-agent
+          candidate-manifest-id: ${{ steps.manifest.outputs.decimal_manifest_id }}
 ```
+
+`$GITHUB_OUTPUT` is per step: the id the extraction step wrote is not in the Action step's own
+`$GITHUB_OUTPUT`, only in `steps.manifest.outputs`. That is why the extraction step needs `id:`
+and the Action takes `candidate-manifest-id` explicitly.
 
 ### 4. Add the secret
 
@@ -128,7 +147,7 @@ setup below.
 | `api-key` | no | — | DecimalAI API key. Pull from GitHub Secrets. **Omit it to run in fixture mode** (see above): no API call, the committed sample report is rendered, the job never fails. |
 | `agent-name` | no (yes for a live run) | — | The DecimalAI agent your production traces are filed under: the name passed to `agent_config(...)` (or to `decimalai.init(agent_name=...)` / `DECIMAL_AGENT_NAME` when no agent config names it). Required whenever `api-key` is set; in fixture mode it only labels the comment. |
 | `github-token` | no | `${{ github.token }}` | Token used to post / update the PR impact comment. Defaults to the automatic per-job token, so the comment works out of the box once the workflow grants `pull-requests: write`. Override only for a different token (e.g. a PAT to comment on forked PRs). Falls back to the `GITHUB_TOKEN` / `GH_TOKEN` env vars if set empty. |
-| `candidate-manifest-id` | no | (auto) | If omitted, reads from `$GITHUB_OUTPUT` (the standard handoff from `decimalai.flush_manifest_for_ci()`) or `./decimal_manifest_id.txt`. |
+| `candidate-manifest-id` | no (yes for a live run in a workflow) | (auto) | The id `decimalai.flush_manifest_for_ci()` wrote in an earlier step: pass `${{ steps.<id>.outputs.decimal_manifest_id }}`. If omitted, the Action looks in its own step's `$GITHUB_OUTPUT` and in `./decimal_manifest_id.txt`. An earlier step's `$GITHUB_OUTPUT` is not visible there, so in a workflow the fallback finds an id only when the script wrote the file, with `flush_manifest_for_ci(..., output_path="decimal_manifest_id.txt")`. |
 | `base-url` | no | `https://api.decimal.ai` | DecimalAI API base URL. Defaults to production. Override only if DecimalAI directs you to a different API host. |
 | `fail-on` | no | `high` | When to fail the workflow: `high` (any HIGH RISK), `medium` (any MEDIUM+), or `none` (warn only). The `unverified` verdict is ranked by the severity of the manifest diff, so `fail-on: high` still fails a PR that deletes a tool on an agent with no traffic. |
 | `on-error` | no | `warn` | What to do when the check could not RUN — a DecimalAI outage or 5xx, a network error, a timeout, or your plan's monthly regression-check quota (429). `warn` posts a "check did not run" comment and exits 0; `fail` reds the job. Misconfiguration (401/403 bad key, 400/404 unknown agent or manifest) is always fatal under both. |
@@ -203,9 +222,10 @@ Subsequent PRs get real impact reports.
 
 ### "No candidate-manifest-id provided or discoverable"
 
-The previous CI step (`scripts/init_for_decimal.py`) didn't write the manifest ID to `$GITHUB_OUTPUT` or `./decimal_manifest_id.txt`. Check that:
+The Action found no candidate manifest id. Check that:
+- The Action step passes `candidate-manifest-id: ${{ steps.<id>.outputs.decimal_manifest_id }}`, and the extraction step has that `id:`. `$GITHUB_OUTPUT` is per step, so without them the Action cannot see what the extraction step wrote.
+- Your init script calls `decimalai.flush_manifest_for_ci(...)`. Building the agent alone registers nothing.
 - `DECIMALAI_MODE=manifest_only` is set when running the init script
-- Your init script calls `decimalai.flush_manifest_for_ci(...)` (or your `build_agent()` triggers automatic capture)
 - The init step succeeded (check the step logs for errors)
 
 ### "Manifest extraction failed"
