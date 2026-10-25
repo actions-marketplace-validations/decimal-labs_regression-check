@@ -27,16 +27,20 @@ pip install decimalai && decimalai demo regression   # ~2 min; needs a free API 
 
 ## Quick start
 
-### 1. Install the SDK in your agent code
+### 1. Connect your agent with the SDK
 
 ```bash
-pip install decimalai
+pip install "decimalai[langchain]"   # or your framework's extra
 ```
 
 ```python
-import decimalai
-decimalai.init(api_key="dai_sk_...")  # or via DECIMAL_API_KEY env var
+from decimalai.langchain import agent_config   # or your framework's agent_config()
+
+support = agent_config("support-agent")  # reads DECIMAL_API_KEY; traces each run under this name
+# create_agent(..., middleware=[support.middleware])
 ```
+
+That name is the `agent-name` the Action takes. [Frameworks](https://docs.decimal.ai/sdk/python/frameworks) has each framework's `agent_config()`.
 
 ### 2. Add a thin init script for CI
 
@@ -122,7 +126,7 @@ setup below.
 | Name | Required | Default | Description |
 |---|---|---|---|
 | `api-key` | no | — | DecimalAI API key. Pull from GitHub Secrets. **Omit it to run in fixture mode** (see above): no API call, the committed sample report is rendered, the job never fails. |
-| `agent-name` | no (yes for a live run) | — | Agent name (matches the value passed to `decimalai.init()`). Required whenever `api-key` is set; in fixture mode it only labels the comment. |
+| `agent-name` | no (yes for a live run) | — | The DecimalAI agent your production traces are filed under: the name passed to `agent_config(...)` (or to `decimalai.init(agent_name=...)` / `DECIMAL_AGENT_NAME` when no agent config names it). Required whenever `api-key` is set; in fixture mode it only labels the comment. |
 | `github-token` | no | `${{ github.token }}` | Token used to post / update the PR impact comment. Defaults to the automatic per-job token, so the comment works out of the box once the workflow grants `pull-requests: write`. Override only for a different token (e.g. a PAT to comment on forked PRs). Falls back to the `GITHUB_TOKEN` / `GH_TOKEN` env vars if set empty. |
 | `candidate-manifest-id` | no | (auto) | If omitted, reads from `$GITHUB_OUTPUT` (the standard handoff from `decimalai.flush_manifest_for_ci()`) or `./decimal_manifest_id.txt`. |
 | `base-url` | no | `https://api.decimal.ai` | DecimalAI API base URL. Defaults to production. Override only if DecimalAI directs you to a different API host. |
@@ -174,8 +178,8 @@ different claims:
 
 `unverified` inherits the severity of the manifest diff, so a deleted tool
 fails under the default `fail-on: high` while a low-severity change only warns.
-To turn `unverified` into a real verdict, instrument production with
-`decimalai.init()` so the agent emits traces, or widen `trace-window-days`.
+To turn `unverified` into a real verdict, connect the production agent with its
+framework's `agent_config()`, which traces every run, or widen `trace-window-days`.
 
 **No agent execution.** We don't run your code in CI. We only diff manifests and query the trace store. See [docs.decimal.ai/guides/regression-check](https://docs.decimal.ai/guides/regression-check) for the architectural detail.
 

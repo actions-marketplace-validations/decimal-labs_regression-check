@@ -18,8 +18,10 @@ inputs:
     default: ''
   agent-name:
     description: |
-      Agent name (matches the value passed to decimalai.init()). Required for a live
-      run; in fixture mode it is only the label on the comment.
+      The DecimalAI agent your production traces are filed under: the name passed to
+      agent_config(...) (or to decimalai.init(agent_name=...) / DECIMAL_AGENT_NAME
+      when no agent config names it). Required for a live run; in fixture mode it is
+      only the label on the comment.
     required: false
     default: ''
   candidate-manifest-id:
