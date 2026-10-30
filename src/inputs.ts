@@ -103,8 +103,9 @@ export function parseInputs(): ActionInputs {
   if (!fixtureMode && !candidateManifestId) {
     throw new Error(
       'No candidate-manifest-id provided or discoverable. ' +
-        'Either pass it explicitly or run decimalai.flush_manifest_for_ci() ' +
-        'in a prior step to write decimal_manifest_id to $GITHUB_OUTPUT.',
+        'Run decimalai.flush_manifest_for_ci() in a prior step with an id: and pass ' +
+        'candidate-manifest-id: ${{ steps.<id>.outputs.decimal_manifest_id }} to this ' +
+        "Action ($GITHUB_OUTPUT is per step, so this step cannot see the earlier one's).",
     );
   }
 

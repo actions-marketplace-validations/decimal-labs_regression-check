@@ -368,7 +368,8 @@ export function formatComment(
     lines.push('');
     lines.push('To get a real verdict:');
     lines.push(
-      '- Instrument production with `decimalai.init()` so the agent emits traces, or',
+      "- Connect the production agent with its framework's `agent_config()`, which " +
+        'traces every run, so it emits traces, or',
     );
     lines.push('- Widen `trace-window-days` if traffic is older than the window.');
     lines.push('');

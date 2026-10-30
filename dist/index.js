@@ -36108,7 +36108,8 @@ function formatComment(report, baseUrl, callReplay, opts) {
             'clean bill of health — the changes above are unverified.');
         lines.push('');
         lines.push('To get a real verdict:');
-        lines.push('- Instrument production with `decimalai.init()` so the agent emits traces, or');
+        lines.push("- Connect the production agent with its framework's `agent_config()`, which " +
+            'traces every run, so it emits traces, or');
         lines.push('- Widen `trace-window-days` if traffic is older than the window.');
         lines.push('');
         lines.push('---');
@@ -36828,8 +36829,9 @@ function parseInputs() {
     const candidateManifestId = fixtureMode ? explicitId : explicitId || resolveCandidateManifestId();
     if (!fixtureMode && !candidateManifestId) {
         throw new Error('No candidate-manifest-id provided or discoverable. ' +
-            'Either pass it explicitly or run decimalai.flush_manifest_for_ci() ' +
-            'in a prior step to write decimal_manifest_id to $GITHUB_OUTPUT.');
+            'Run decimalai.flush_manifest_for_ci() in a prior step with an id: and pass ' +
+            'candidate-manifest-id: ${{ steps.<id>.outputs.decimal_manifest_id }} to this ' +
+            "Action ($GITHUB_OUTPUT is per step, so this step cannot see the earlier one's).");
     }
     const baseUrl = (core.getInput('base-url') || 'https://api.decimal.ai').replace(/\/$/, '');
     // PR-comment token. The `github-token` input defaults to ${{ github.token }}

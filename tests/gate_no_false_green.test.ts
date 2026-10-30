@@ -150,7 +150,7 @@ describe('the unverified PR comment', () => {
   it('says why there is no verdict and how to get one', () => {
     const body = md();
     expect(body).toContain('Impact: not measured.');
-    expect(body).toContain('decimalai.init()');
+    expect(body).toContain('`agent_config()`');
     expect(body).toContain('trace-window-days');
   });
 
