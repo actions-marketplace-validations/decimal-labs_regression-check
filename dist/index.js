@@ -10664,11 +10664,77 @@ class Request {
     }
   }
 
-  onUpgrade (statusCode, headers, socket) {
+  /**
+   * @param {number|null} statusCode
+   * @param {Buffer[]|null} headers
+   * @param {import('node:stream').Duplex} socket
+   * @param {string} [statusText]
+   */
+  onUpgrade (statusCode, headers, socket, statusText = '') {
+    this.onFinally()
+
     assert(!this.aborted)
     assert(!this.completed)
 
-    return this[kHandler].onUpgrade(statusCode, headers, socket)
+    if (statusCode !== null) {
+      this.#publishUpgradeHeaders(statusCode, headers, statusText)
+    }
+
+    const result = this[kHandler].onUpgrade(statusCode, headers, socket)
+
+    if (!this.aborted) {
+      this.completed = true
+      if (statusCode !== null) {
+        this.#publishUpgradeTrailers()
+      }
+    }
+
+    return result
+  }
+
+  /**
+   * @param {number} statusCode
+   * @param {import('node:http2').IncomingHttpHeaders} headers
+   * @param {(headers: import('node:http2').IncomingHttpHeaders) => Buffer[]} parseHeaders
+   * @param {string} [statusText]
+   */
+  onUpgradeResponse (statusCode, headers, parseHeaders, statusText = '') {
+    assert(!this.aborted)
+    assert(this.completed)
+
+    if (channels.headers.hasSubscribers) {
+      this.#publishUpgradeHeaders(statusCode, parseHeaders(headers), statusText)
+    }
+    this.#publishUpgradeTrailers()
+  }
+
+  /**
+   * @param {Error} error
+   */
+  onUpgradeError (error) {
+    assert(!this.aborted)
+    assert(this.completed)
+
+    if (channels.error.hasSubscribers) {
+      channels.error.publish({ request: this, error })
+    }
+  }
+
+  /**
+   * @param {number} statusCode
+   * @param {Buffer[]} headers
+   * @param {string} statusText
+   */
+  #publishUpgradeHeaders (statusCode, headers, statusText) {
+    if (channels.headers.hasSubscribers) {
+      channels.headers.publish({ request: this, response: { statusCode, headers, statusText } })
+    }
+  }
+
+  #publishUpgradeTrailers () {
+    if (channels.trailers.hasSubscribers) {
+      channels.trailers.publish({ request: this, trailers: [] })
+    }
   }
 
   onComplete (trailers) {
@@ -11809,7 +11875,7 @@ function defaultFactory (origin, opts) {
 }
 
 class Agent extends DispatcherBase {
-  constructor ({ factory = defaultFactory, maxRedirections = 0, connect, ...options } = {}) {
+  constructor ({ factory = defaultFactory, maxRedirections = 0, connect, tls, ...options } = {}) {
     if (typeof factory !== 'function') {
       throw new InvalidArgumentError('factory must be a function.')
     }
@@ -11828,11 +11894,15 @@ class Agent extends DispatcherBase {
       connect = { ...connect }
     }
 
+    if (tls && typeof tls !== 'function') {
+      tls = { ...tls }
+    }
+
     this[kInterceptors] = options.interceptors?.Agent && Array.isArray(options.interceptors.Agent)
       ? options.interceptors.Agent
       : [createRedirectInterceptor({ maxRedirections })]
 
-    this[kOptions] = { ...util.deepClone(options), connect }
+    this[kOptions] = { ...util.deepClone(options), connect, tls }
     this[kOptions].interceptors = options.interceptors
       ? { ...options.interceptors }
       : undefined
@@ -12572,7 +12642,7 @@ class Parser {
   }
 
   onUpgrade (head) {
-    const { upgrade, client, socket, headers, statusCode } = this
+    const { upgrade, client, socket, headers, statusCode, statusText } = this
 
     assert(upgrade)
     assert(client[kSocket] === socket)
@@ -12607,9 +12677,10 @@ class Parser {
     client.emit('disconnect', client[kUrl], [client], new InformationalError('upgrade'))
 
     try {
-      request.onUpgrade(statusCode, headers, socket)
-    } catch (err) {
-      util.destroy(socket, err)
+      request.onUpgrade(statusCode, headers, socket, statusText)
+    } catch (error) {
+      util.errorRequest(client, request, error)
+      util.destroy(socket, error)
     }
 
     client[kResume]()
@@ -12866,8 +12937,6 @@ async function connectH1 (client, socket) {
   socket[kParser] = new Parser(client, socket, llhttpInstance)
 
   addListener(socket, 'error', function (err) {
-    assert(err.code !== 'ERR_TLS_CERT_ALTNAME_INVALID')
-
     const parser = this[kParser]
 
     // On Mac OS, we get an ECONNRESET even if there is a full body to be forwarded
@@ -13016,7 +13085,7 @@ async function connectH1 (client, socket) {
 
 function clearIdleSocketValidation (socket) {
   if (socket[kIdleSocketValidationTimeout]) {
-    clearTimeout(socket[kIdleSocketValidationTimeout])
+    clearImmediate(socket[kIdleSocketValidationTimeout])
     socket[kIdleSocketValidationTimeout] = null
   }
 
@@ -13025,15 +13094,23 @@ function clearIdleSocketValidation (socket) {
 
 function scheduleIdleSocketValidation (client, socket) {
   socket[kIdleSocketValidation] = 1
-  socket[kIdleSocketValidationTimeout] = setTimeout(() => {
+  // Yield to the check phase (after poll) so unsolicited bytes / FIN / RST
+  // already pending on this idle keep-alive socket are processed before the
+  // next request is written (GHSA-35p6-xmwp-9g52).
+  //
+  // setTimeout(0) pays Node's ~1ms timer floor on every sequential reuse
+  // (#5493). setImmediate avoids that, but an *unref'd* Immediate lets poll
+  // block for ~500ms when the event loop is otherwise idle (#5600 / #5606).
+  // A ref'd Immediate both keeps the pending request alive and makes poll
+  // return immediately — the hybrid those issues asked for.
+  socket[kIdleSocketValidationTimeout] = setImmediate(() => {
     socket[kIdleSocketValidationTimeout] = null
     socket[kIdleSocketValidation] = 2
 
     if (client[kSocket] === socket && !socket.destroyed) {
       client[kResume]()
     }
-  }, 0)
-  socket[kIdleSocketValidationTimeout].unref?.()
+  })
 }
 
 /**
@@ -13182,12 +13259,22 @@ function writeH1 (client, request) {
   const socket = client[kSocket]
   clearIdleSocketValidation(socket)
 
-  const abort = (err) => {
-    if (request.aborted || request.completed) {
+  /**
+   * @param {Error} [error]
+   */
+  const abort = (error) => {
+    if (request.aborted) {
       return
     }
 
-    util.errorRequest(client, request, err || new RequestAbortedError())
+    if (request.completed) {
+      if (request.upgrade || request.method === 'CONNECT') {
+        util.destroy(socket, new InformationalError('aborted'))
+      }
+      return
+    }
+
+    util.errorRequest(client, request, error || new RequestAbortedError())
 
     util.destroy(body)
     util.destroy(socket, new InformationalError('aborted'))
@@ -13645,6 +13732,7 @@ module.exports = connectH1
 
 
 const assert = __nccwpck_require__(4589)
+const { errorMonitor } = __nccwpck_require__(8474)
 const { pipeline } = __nccwpck_require__(7075)
 const util = __nccwpck_require__(3440)
 const {
@@ -13721,6 +13809,15 @@ function parseH2Headers (headers) {
   return result
 }
 
+/**
+ * @param {import('node:http2').IncomingHttpHeaders} headers
+ * @returns {Buffer[]}
+ */
+function parseH2ResponseHeaders (headers) {
+  const { [HTTP2_HEADER_STATUS]: _statusCode, ...realHeaders } = headers
+  return parseH2Headers(realHeaders)
+}
+
 async function connectH2 (client, socket) {
   client[kSocket] = socket
 
@@ -13770,8 +13867,6 @@ async function connectH2 (client, socket) {
   socket[kHTTP2Session] = session
 
   util.addListener(socket, 'error', function (err) {
-    assert(err.code !== 'ERR_TLS_CERT_ALTNAME_INVALID')
-
     this[kError] = err
 
     this[kClient][kOnError](err)
@@ -13845,8 +13940,6 @@ function resumeH2 (client) {
 }
 
 function onHttp2SessionError (err) {
-  assert(err.code !== 'ERR_TLS_CERT_ALTNAME_INVALID')
-
   this[kSocket][kError] = err
   this[kClient][kOnError](err)
 }
@@ -13941,22 +14034,32 @@ function writeH2 (client, request) {
   headers[HTTP2_HEADER_AUTHORITY] = host || `${hostname}${port ? `:${port}` : ''}`
   headers[HTTP2_HEADER_METHOD] = method
 
-  const abort = (err) => {
-    if (request.aborted || request.completed) {
+  /**
+   * @param {Error} [error]
+   */
+  const abort = (error) => {
+    if (request.aborted) {
       return
     }
 
-    err = err || new RequestAbortedError()
+    if (request.completed) {
+      if (method === 'CONNECT' && stream != null) {
+        util.destroy(stream, error || new RequestAbortedError())
+      }
+      return
+    }
 
-    util.errorRequest(client, request, err)
+    error = error || new RequestAbortedError()
+
+    util.errorRequest(client, request, error)
 
     if (stream != null) {
-      util.destroy(stream, err)
+      util.destroy(stream, error)
     }
 
     // We do not destroy the socket as we can continue using the session
     // the stream get's destroyed and the session remains to create new streams
-    util.destroy(body, err)
+    util.destroy(body, error)
     client[kQueue][client[kRunningIdx]++] = null
     client[kResume]()
   }
@@ -13975,25 +14078,57 @@ function writeH2 (client, request) {
 
   if (method === 'CONNECT') {
     session.ref()
-    // We are already connected, streams are pending, first request
-    // will create a new stream. We trigger a request to create the stream and wait until
-    // `ready` event is triggered
     // We disabled endStream to allow the user to write to the stream
     stream = session.request(headers, { endStream: false, signal })
+    let upgradeResponseFinished = false
 
-    if (stream.id && !stream.pending) {
-      request.onUpgrade(null, null, stream)
-      ++session[kOpenStreams]
-      client[kQueue][client[kRunningIdx]++] = null
-    } else {
-      stream.once('ready', () => {
-        request.onUpgrade(null, null, stream)
-        ++session[kOpenStreams]
-        client[kQueue][client[kRunningIdx]++] = null
-      })
+    /**
+     * @param {import('node:http2').IncomingHttpHeaders} headers
+     */
+    const onResponse = (headers) => {
+      upgradeResponseFinished = true
+      stream.off(errorMonitor, onUpgradeError)
+      request.onUpgradeResponse(Number(headers[HTTP2_HEADER_STATUS]), headers, parseH2ResponseHeaders)
     }
 
+    /**
+     * @param {Error} error
+     */
+    const onUpgradeError = (error) => {
+      upgradeResponseFinished = true
+      stream.off('response', onResponse)
+      request.onUpgradeError(error)
+    }
+
+    const onReady = () => {
+      try {
+        request.onUpgrade(null, null, stream)
+      } catch (error) {
+        stream.off('response', onResponse)
+        abort(error)
+        return
+      }
+
+      if (request.aborted) {
+        return
+      }
+
+      stream.off('error', abort)
+      stream.once(errorMonitor, onUpgradeError)
+      client[kQueue][client[kRunningIdx]++] = null
+    }
+
+    stream.once('response', onResponse)
+    stream.once('error', abort)
+    ++session[kOpenStreams]
+    onReady()
+
     stream.once('close', () => {
+      if (!upgradeResponseFinished && request.completed) {
+        stream.off('response', onResponse)
+        stream.off(errorMonitor, onUpgradeError)
+        request.onUpgradeError(new InformationalError(`HTTP/2: "stream error" received - code ${stream.rstCode}`))
+      }
       session[kOpenStreams] -= 1
       if (session[kOpenStreams] === 0) session.unref()
     })
@@ -14503,9 +14638,10 @@ class Client extends DispatcherBase {
     // h2
     maxConcurrentStreams,
     allowH2,
-    webSocket
+    webSocket,
+    eventSource
   } = {}) {
-    super({ webSocket })
+    super({ webSocket, eventSource })
 
     if (keepAlive !== undefined) {
       throw new InvalidArgumentError('unsupported keepAlive, use pipelining=0 instead')
@@ -15027,6 +15163,7 @@ module.exports = Client
 "use strict";
 
 
+const buffer = __nccwpck_require__(4573)
 const Dispatcher = __nccwpck_require__(883)
 const {
   ClientDestroyedError,
@@ -15039,6 +15176,7 @@ const kOnDestroyed = Symbol('onDestroyed')
 const kOnClosed = Symbol('onClosed')
 const kInterceptedDispatch = Symbol('Intercepted Dispatch')
 const kWebSocketOptions = Symbol('webSocketOptions')
+const kEventSourceOptions = Symbol('eventSourceOptions')
 
 class DispatcherBase extends Dispatcher {
   constructor (opts) {
@@ -15049,12 +15187,19 @@ class DispatcherBase extends Dispatcher {
     this[kClosed] = false
     this[kOnClosed] = []
     this[kWebSocketOptions] = opts?.webSocket ?? {}
+    this[kEventSourceOptions] = opts?.eventSource ?? {}
   }
 
   get webSocketOptions () {
     return {
       maxFragments: this[kWebSocketOptions].maxFragments ?? 131072,
       maxPayloadSize: this[kWebSocketOptions].maxPayloadSize ?? 128 * 1024 * 1024
+    }
+  }
+
+  get eventSourceOptions () {
+    return {
+      maxEventSize: this[kEventSourceOptions].maxEventSize ?? buffer.kStringMaxLength
     }
   }
 
@@ -16705,6 +16850,7 @@ class RetryHandler {
     this.end = null
     this.etag = null
     this.resume = null
+    this.headersSent = false
 
     // Handle possible onConnect duplication
     this.handler.onConnect(reason => {
@@ -16715,6 +16861,20 @@ class RetryHandler {
         this.reason = reason
       }
     })
+  }
+
+  checkpointResponseEnd (headers, resume) {
+    if (this.end == null && this.opts.method !== 'HEAD') {
+      const contentLength = headers['content-length']
+      this.end = contentLength != null ? Number(contentLength) - 1 : null
+
+      assert(
+        this.end == null || Number.isFinite(this.end),
+        'invalid content-length'
+      )
+    }
+
+    this.resume = this.end != null ? resume : null
   }
 
   onRequestSent () {
@@ -16805,7 +16965,12 @@ class RetryHandler {
     this.retryCount += 1
 
     if (statusCode >= 300) {
-      if (this.retryOpts.statusCodes.includes(statusCode) === false) {
+      // Only expose a response if no earlier attempt has reached the caller.
+      // Otherwise abort this attempt so the error settles the existing body
+      // instead of replacing it with a new response.
+      if (!this.headersSent && this.retryOpts.statusCodes.includes(statusCode) === false) {
+        this.headersSent = true
+        this.checkpointResponseEnd(headers, resume)
         return this.handler.onHeaders(
           statusCode,
           rawHeaders,
@@ -16874,8 +17039,15 @@ class RetryHandler {
 
       const { start, size, end = size - 1 } = contentRange
 
-      assert(this.start === start, 'content-range mismatch')
-      assert(this.end == null || this.end === end, 'content-range mismatch')
+      if (this.start !== start || (this.end != null && this.end !== end)) {
+        this.abort(
+          new RequestRetryError('Content-Range mismatch', statusCode, {
+            headers,
+            data: { count: this.retryCount }
+          })
+        )
+        return false
+      }
 
       this.resume = resume
       return true
@@ -16887,6 +17059,7 @@ class RetryHandler {
         const range = parseRangeHeader(headers['content-range'])
 
         if (range == null) {
+          this.headersSent = true
           return this.handler.onHeaders(
             statusCode,
             rawHeaders,
@@ -16925,6 +17098,7 @@ class RetryHandler {
       )
 
       this.resume = resume
+      this.headersSent = true
       this.etag = headers.etag != null ? headers.etag : null
 
       // Weak etags are not useful for comparison nor cache
@@ -16964,7 +17138,7 @@ class RetryHandler {
   }
 
   onError (err) {
-    if (this.aborted || isDisturbed(this.opts.body)) {
+    if (this.aborted || isDisturbed(this.opts.body) || (this.headersSent && this.resume == null)) {
       return this.handler.onError(err)
     }
 
@@ -21426,6 +21600,7 @@ module.exports = {
 
 "use strict";
 
+const buffer = __nccwpck_require__(4573)
 const { Transform } = __nccwpck_require__(7075)
 const { isASCIINumber, isValidLastEventId } = __nccwpck_require__(4811)
 
@@ -21449,6 +21624,63 @@ const COLON = 0x3A
  * @type {32} SPACE
  */
 const SPACE = 0x20
+
+const defaultMaxEventSize = buffer.kStringMaxLength
+
+const DATA = Buffer.from('data')
+const EVENT = Buffer.from('event')
+const ID = Buffer.from('id')
+const RETRY = Buffer.from('retry')
+
+// Each data field creates a string node, and each unconsumed input chunk keeps
+// a Buffer wrapper. The absolute ceiling protects the large default byte limit.
+const minParserItems = 1024
+const maxParserItems = 131072
+const bytesPerParserItem = 128
+
+function isASCIINumberBytes (buffer, start) {
+  if (start >= buffer.length) {
+    return false
+  }
+
+  for (let i = start; i < buffer.length; i++) {
+    if (buffer[i] < 0x30 || buffer[i] > 0x39) {
+      return false
+    }
+  }
+
+  return true
+}
+
+function isValidLastEventIdBytes (buffer, start) {
+  for (let i = start; i < buffer.length; i++) {
+    if (buffer[i] === 0x00) {
+      return false
+    }
+  }
+
+  return true
+}
+
+function isFieldName (line, length, field) {
+  if (length !== field.length) {
+    return false
+  }
+
+  for (let i = 0; i < length; i++) {
+    if (line[i] !== field[i]) {
+      return false
+    }
+  }
+
+  return true
+}
+
+function createMaxEventSizeExceededError () {
+  const error = new Error('EventSource message size exceeded')
+  error.aborted = false
+  return error
+}
 
 /**
  * @typedef {object} EventSourceStreamEvent
@@ -21490,11 +21722,21 @@ class EventSourceStream extends Transform {
   eventEndCheck = false
 
   /**
-   * @type {Buffer}
+   * @type {Buffer[]}
    */
-  buffer = null
+  chunks = []
 
+  chunkIndex = 0
   pos = 0
+  lineChunkIndex = 0
+  linePos = 0
+  lineLength = 0
+  eventSize = 0
+  eventFieldSizes = { data: 0, event: 0, id: 0, retry: 0 }
+  dataLineCount = 0
+  maxEventSize
+  maxDataLines
+  maxBufferedChunks
 
   event = {
     data: undefined,
@@ -21505,6 +21747,7 @@ class EventSourceStream extends Transform {
 
   /**
    * @param {object} options
+   * @param {number} [options.maxEventSize]
    * @param {eventSourceSettings} options.eventSourceSettings
    * @param {Function} [options.push]
    */
@@ -21516,6 +21759,12 @@ class EventSourceStream extends Transform {
     super(options)
 
     this.state = options.eventSourceSettings || {}
+    this.maxEventSize = options.maxEventSize ?? defaultMaxEventSize
+    const parserItemLimit = this.maxEventSize > 0
+      ? Math.min(maxParserItems, Math.max(minParserItems, Math.floor(this.maxEventSize / bytesPerParserItem)))
+      : 0
+    this.maxDataLines = parserItemLimit
+    this.maxBufferedChunks = parserItemLimit
     if (options.push) {
       this.push = options.push
     }
@@ -21533,92 +21782,28 @@ class EventSourceStream extends Transform {
       return
     }
 
-    // Cache the chunk in the buffer, as the data might not be complete while
-    // processing it
-    // TODO: Investigate if there is a more performant way to handle
-    // incoming chunks
-    // see: https://github.com/nodejs/undici/issues/2630
-    if (this.buffer) {
-      this.buffer = Buffer.concat([this.buffer, chunk])
-    } else {
-      this.buffer = chunk
+    // A leading line ending can immediately release the currently buffered
+    // line, even when it uses the final allowed chunk slot.
+    if (this.maxEventSize > 0 &&
+        this.chunks.length >= this.maxBufferedChunks &&
+        chunk[0] !== LF && chunk[0] !== CR) {
+      callback(createMaxEventSizeExceededError())
+      return
     }
+    this.chunks.push(chunk)
 
     // Strip leading byte-order-mark if we opened the stream and started
     // the processing of the incoming data
     if (this.checkBOM) {
-      switch (this.buffer.length) {
-        case 1:
-          // Check if the first byte is the same as the first byte of the BOM
-          if (this.buffer[0] === BOM[0]) {
-            // If it is, we need to wait for more data
-            callback()
-            return
-          }
-          // Set the checkBOM flag to false as we don't need to check for the
-          // BOM anymore
-          this.checkBOM = false
-
-          // The buffer only contains one byte so we need to wait for more data
-          callback()
-          return
-        case 2:
-          // Check if the first two bytes are the same as the first two bytes
-          // of the BOM
-          if (
-            this.buffer[0] === BOM[0] &&
-            this.buffer[1] === BOM[1]
-          ) {
-            // If it is, we need to wait for more data, because the third byte
-            // is needed to determine if it is the BOM or not
-            callback()
-            return
-          }
-
-          // Set the checkBOM flag to false as we don't need to check for the
-          // BOM anymore
-          this.checkBOM = false
-          break
-        case 3:
-          // Check if the first three bytes are the same as the first three
-          // bytes of the BOM
-          if (
-            this.buffer[0] === BOM[0] &&
-            this.buffer[1] === BOM[1] &&
-            this.buffer[2] === BOM[2]
-          ) {
-            // If it is, we can drop the buffered data, as it is only the BOM
-            this.buffer = Buffer.alloc(0)
-            // Set the checkBOM flag to false as we don't need to check for the
-            // BOM anymore
-            this.checkBOM = false
-
-            // Await more data
-            callback()
-            return
-          }
-          // If it is not the BOM, we can start processing the data
-          this.checkBOM = false
-          break
-        default:
-          // The buffer is longer than 3 bytes, so we can drop the BOM if it is
-          // present
-          if (
-            this.buffer[0] === BOM[0] &&
-            this.buffer[1] === BOM[1] &&
-            this.buffer[2] === BOM[2]
-          ) {
-            // Remove the BOM from the buffer
-            this.buffer = this.buffer.subarray(3)
-          }
-
-          // Set the checkBOM flag to false as we don't need to check for the
-          this.checkBOM = false
-          break
+      if (this.handleBOM()) {
+        callback()
+        return
       }
     }
 
-    while (this.pos < this.buffer.length) {
+    while (this.hasCurrentByte()) {
+      const byte = this.currentByte()
+
       // If the previous line ended with an end-of-line, we need to check
       // if the next character is also an end-of-line.
       if (this.eventEndCheck) {
@@ -21631,10 +21816,9 @@ class EventSourceStream extends Transform {
         if (this.crlfCheck) {
           // If the current character is a line feed, we can remove it
           // from the buffer and reset the crlfCheck flag
-          if (this.buffer[this.pos] === LF) {
-            this.buffer = this.buffer.subarray(this.pos + 1)
-            this.pos = 0
+          if (byte === LF) {
             this.crlfCheck = false
+            this.consumeCurrentByte()
 
             // It is possible that the line feed is not the end of the
             // event. We need to check if the next character is an
@@ -21650,19 +21834,17 @@ class EventSourceStream extends Transform {
           this.crlfCheck = false
         }
 
-        if (this.buffer[this.pos] === LF || this.buffer[this.pos] === CR) {
+        if (byte === LF || byte === CR) {
           // If the current character is a carriage return, we need to
           // set the crlfCheck flag to true, as we need to check if the
           // next character is a line feed so we can remove it from the
           // buffer
-          if (this.buffer[this.pos] === CR) {
+          if (byte === CR) {
             this.crlfCheck = true
           }
 
-          this.buffer = this.buffer.subarray(this.pos + 1)
-          this.pos = 0
-          if (
-            this.event.data !== undefined || this.event.event || this.event.id || this.event.retry) {
+          this.consumeCurrentByte()
+          if (this.hasPendingEvent()) {
             this.processEvent(this.event)
           }
           this.clearEvent()
@@ -21676,22 +21858,23 @@ class EventSourceStream extends Transform {
 
       // If the current character is an end-of-line, we can process the
       // line
-      if (this.buffer[this.pos] === LF || this.buffer[this.pos] === CR) {
+      if (byte === LF || byte === CR) {
         // If the current character is a carriage return, we need to
         // set the crlfCheck flag to true, as we need to check if the
         // next character is a line feed
-        if (this.buffer[this.pos] === CR) {
+        if (byte === CR) {
           this.crlfCheck = true
         }
 
         // In any case, we can process the line as we reached an
         // end-of-line character
-        this.parseLine(this.buffer.subarray(0, this.pos), this.event)
-
-        // Remove the processed line from the buffer
-        this.buffer = this.buffer.subarray(this.pos + 1)
-        // Reset the position as we removed the processed line from the buffer
-        this.pos = 0
+        try {
+          this.parseLine(this.readLine(), this.event)
+        } catch (error) {
+          callback(error)
+          return
+        }
+        this.consumeCurrentByte()
         // A line was processed and this could be the end of the event. We need
         // to check if the next line is empty to determine if the event is
         // finished.
@@ -21699,15 +21882,28 @@ class EventSourceStream extends Transform {
         continue
       }
 
-      this.pos++
+      // readLine() is only called after CR or LF. Reject an unfinished line
+      // before it can retain an unbounded number of decoded chunks. The seven
+      // extra bytes allow the longest field prefix ("event: " or "retry: ").
+      if (this.maxEventSize > 0 && ++this.lineLength > this.maxEventSize + 7) {
+        callback(createMaxEventSizeExceededError())
+        return
+      }
+      this.advanceCursor()
     }
 
     callback()
   }
 
+  _destroy (error, callback) {
+    this.chunks.length = 0
+    this.clearEvent()
+    super._destroy(error, callback)
+  }
+
   /**
    * @param {Buffer} line
-   * @param {EventStreamEvent} event
+   * @param {EventSourceStreamEvent} event
    */
   parseLine (line, event) {
     // If the line is empty (a blank line)
@@ -21724,65 +21920,72 @@ class EventSourceStream extends Transform {
       return
     }
 
-    let field = ''
-    let value = ''
+    let fieldLength = line.length
+    let valueStart = line.length
 
     // If the line contains a U+003A COLON character (:)
     if (colonPosition !== -1) {
-      // Collect the characters on the line before the first U+003A COLON
-      // character (:), and let field be that string.
-      // TODO: Investigate if there is a more performant way to extract the
-      // field
-      // see: https://github.com/nodejs/undici/issues/2630
-      field = line.subarray(0, colonPosition).toString('utf8')
+      fieldLength = colonPosition
 
       // Collect the characters on the line after the first U+003A COLON
       // character (:), and let value be that string.
       // If value starts with a U+0020 SPACE character, remove it from value.
-      let valueStart = colonPosition + 1
+      valueStart = colonPosition + 1
       if (line[valueStart] === SPACE) {
         ++valueStart
       }
-      // TODO: Investigate if there is a more performant way to extract the
-      // value
-      // see: https://github.com/nodejs/undici/issues/2630
-      value = line.subarray(valueStart).toString('utf8')
-
-      // Otherwise, the string is not empty but does not contain a U+003A COLON
-      // character (:)
-    } else {
-      // Process the field using the steps described below, using the whole
-      // line as the field name, and the empty string as the field value.
-      field = line.toString('utf8')
-      value = ''
     }
 
-    // Modify the event with the field name and value. The value is also
-    // decoded as UTF-8
-    switch (field) {
-      case 'data':
-        if (event[field] === undefined) {
-          event[field] = value
-        } else {
-          event[field] += `\n${value}`
-        }
-        break
-      case 'retry':
-        if (isASCIINumber(value)) {
-          event[field] = value
-        }
-        break
-      case 'id':
-        if (isValidLastEventId(value)) {
-          event[field] = value
-        }
-        break
-      case 'event':
-        if (value.length > 0) {
-          event[field] = value
-        }
-        break
+    if (isFieldName(line, fieldLength, DATA)) {
+      if (this.maxEventSize > 0 && this.dataLineCount >= this.maxDataLines) {
+        throw createMaxEventSizeExceededError()
+      }
+      const valueBytes = line.length - valueStart
+      const dataSize = this.eventFieldSizes.data + (event.data === undefined ? 0 : 1) + valueBytes
+      this.setEventFieldSize('data', dataSize)
+
+      const value = line.toString('utf8', valueStart)
+
+      if (event.data === undefined) {
+        event.data = value
+      } else {
+        event.data += `\n${value}`
+      }
+      this.dataLineCount++
+      return
     }
+
+    if (isFieldName(line, fieldLength, RETRY)) {
+      if (isASCIINumberBytes(line, valueStart)) {
+        this.setEventFieldSize('retry', line.length - valueStart)
+        event.retry = line.toString('utf8', valueStart)
+      }
+      return
+    }
+
+    if (isFieldName(line, fieldLength, ID)) {
+      if (isValidLastEventIdBytes(line, valueStart)) {
+        this.setEventFieldSize('id', line.length - valueStart)
+        event.id = line.toString('utf8', valueStart)
+      }
+      return
+    }
+
+    if (isFieldName(line, fieldLength, EVENT)) {
+      if (valueStart < line.length) {
+        this.setEventFieldSize('event', line.length - valueStart)
+        event.event = line.toString('utf8', valueStart)
+      }
+    }
+  }
+
+  setEventFieldSize (field, size) {
+    const eventSize = this.eventSize - this.eventFieldSizes[field] + size
+    if (this.maxEventSize > 0 && eventSize > this.maxEventSize) {
+      throw createMaxEventSizeExceededError()
+    }
+    this.eventSize = eventSize
+    this.eventFieldSizes[field] = size
   }
 
   /**
@@ -21811,12 +22014,159 @@ class EventSourceStream extends Transform {
   }
 
   clearEvent () {
-    this.event = {
-      data: undefined,
-      event: undefined,
-      id: undefined,
-      retry: undefined
+    this.event.data = undefined
+    this.event.event = undefined
+    this.event.id = undefined
+    this.event.retry = undefined
+    this.eventSize = 0
+    this.dataLineCount = 0
+    this.eventFieldSizes.data = 0
+    this.eventFieldSizes.event = 0
+    this.eventFieldSizes.id = 0
+    this.eventFieldSizes.retry = 0
+  }
+
+  hasPendingEvent () {
+    return this.event.data !== undefined ||
+      this.event.event !== undefined ||
+      this.event.id !== undefined ||
+      this.event.retry !== undefined
+  }
+
+  hasCurrentByte () {
+    return this.chunkIndex < this.chunks.length &&
+      this.pos < this.chunks[this.chunkIndex].length
+  }
+
+  currentByte () {
+    return this.chunks[this.chunkIndex][this.pos]
+  }
+
+  consumeCurrentByte () {
+    this.advanceCursor()
+    this.syncLineStartToCursor()
+  }
+
+  advanceCursor () {
+    this.pos++
+
+    while (this.chunkIndex < this.chunks.length && this.pos >= this.chunks[this.chunkIndex].length) {
+      this.chunkIndex++
+      this.pos = 0
     }
+  }
+
+  syncLineStartToCursor () {
+    this.lineChunkIndex = this.chunkIndex
+    this.linePos = this.pos
+    this.lineLength = 0
+    this.dropConsumedChunks()
+  }
+
+  dropConsumedChunks () {
+    if (this.lineChunkIndex > 0) {
+      const consumed = this.lineChunkIndex
+      this.chunks.splice(0, consumed)
+      this.lineChunkIndex = 0
+      this.chunkIndex -= consumed
+    }
+
+    if (this.chunkIndex === this.chunks.length) {
+      this.chunks.length = 0
+      this.chunkIndex = 0
+      this.pos = 0
+      this.lineChunkIndex = 0
+      this.linePos = 0
+    }
+  }
+
+  readLine () {
+    if (this.lineChunkIndex === this.chunkIndex) {
+      return this.chunks[this.chunkIndex].subarray(this.linePos, this.pos)
+    }
+
+    const chunks = []
+    let length = 0
+
+    for (let i = this.lineChunkIndex; i <= this.chunkIndex; i++) {
+      const chunk = this.chunks[i]
+      const start = i === this.lineChunkIndex ? this.linePos : 0
+      const end = i === this.chunkIndex ? this.pos : chunk.length
+      const slice = chunk.subarray(start, end)
+      length += slice.length
+      chunks.push(slice)
+    }
+
+    return Buffer.concat(chunks, length)
+  }
+
+  peekBufferedByte (offset) {
+    let chunkIndex = this.lineChunkIndex
+    let pos = this.linePos
+
+    while (chunkIndex < this.chunks.length) {
+      const chunk = this.chunks[chunkIndex]
+      const remaining = chunk.length - pos
+
+      if (offset < remaining) {
+        return chunk[pos + offset]
+      }
+
+      offset -= remaining
+      chunkIndex++
+      pos = 0
+    }
+  }
+
+  discardLeadingBytes (count) {
+    while (count > 0 && this.lineChunkIndex < this.chunks.length) {
+      const chunk = this.chunks[this.lineChunkIndex]
+      const remaining = chunk.length - this.linePos
+
+      if (count < remaining) {
+        this.linePos += count
+        count = 0
+      } else {
+        count -= remaining
+        this.lineChunkIndex++
+        this.linePos = 0
+      }
+    }
+
+    this.chunkIndex = this.lineChunkIndex
+    this.pos = this.linePos
+    this.dropConsumedChunks()
+  }
+
+  handleBOM () {
+    const first = this.peekBufferedByte(0)
+    const second = this.peekBufferedByte(1)
+    const third = this.peekBufferedByte(2)
+
+    if (second === undefined) {
+      if (first === BOM[0]) {
+        return true
+      }
+
+      this.checkBOM = false
+      return true
+    }
+
+    if (third === undefined) {
+      if (first === BOM[0] && second === BOM[1]) {
+        return true
+      }
+
+      this.checkBOM = false
+      return false
+    }
+
+    if (first === BOM[0] && second === BOM[1] && third === BOM[2]) {
+      this.discardLeadingBytes(3)
+    }
+
+    this.checkBOM = false
+    return !this.hasCurrentByte()
   }
 }
 
@@ -21844,6 +22194,7 @@ const { isNetworkError } = __nccwpck_require__(9051)
 const { delay } = __nccwpck_require__(4811)
 const { kEnumerableProperty } = __nccwpck_require__(3440)
 const { environmentSettingsObject } = __nccwpck_require__(3168)
+const { getGlobalDispatcher } = __nccwpck_require__(2581)
 
 let experimentalWarned = false
 
@@ -22125,6 +22476,7 @@ class EventSource extends EventTarget {
 
       const eventSourceStream = new EventSourceStream({
         eventSourceSettings: this.#state,
+        maxEventSize: this.#dispatcher.eventSourceOptions?.maxEventSize,
         push: (event) => {
           this.dispatchEvent(createFastMessageEvent(
             event.type,
@@ -22303,7 +22655,8 @@ webidl.converters.EventSourceInitDict = webidl.dictionaryConverter([
   },
   {
     key: 'dispatcher', // undici only
-    converter: webidl.converters.any
+    converter: webidl.converters.any,
+    defaultValue: () => getGlobalDispatcher()
   }
 ])
 
@@ -27410,8 +27763,10 @@ async function httpNetworkFetch (
   // 19. Run these steps in parallel:
 
   //    1. Run these steps, but abort when fetchParams is canceled:
-  fetchParams.controller.onAborted = onAborted
-  fetchParams.controller.on('terminated', onAborted)
+  if (!fetchParams.controller.resume) {
+    fetchParams.controller.on('terminated', onAborted)
+  }
+
   fetchParams.controller.resume = async () => {
     // 1. While true
     while (true) {
@@ -27580,8 +27935,6 @@ async function httpNetworkFetch (
           }
           location = headersList.get('location', true)
 
-          this.body = new Readable({ read: resume })
-
           const decoders = []
 
           const willFollow = location && request.redirect === 'follow' &&
@@ -27599,7 +27952,7 @@ async function httpNetworkFetch (
             // CVE fix similar to urllib3 (GHSA-gm62-xv2j-4w53) and curl (CVE-2022-32206).
             const maxContentEncodings = 5
             if (codings.length > maxContentEncodings) {
-              reject(new Error(`too many content-encodings in response: ${codings.length}, maximum allowed is ${maxContentEncodings}`))
+              this.abort(new Error(`too many content-encodings in response: ${codings.length}, maximum allowed is ${maxContentEncodings}`))
               return true
             }
 
@@ -27631,6 +27984,8 @@ async function httpNetworkFetch (
               }
             }
           }
+
+          this.body = new Readable({ read: resume })
 
           const onError = this.onError.bind(this)
 
@@ -27676,10 +28031,6 @@ async function httpNetworkFetch (
         onComplete () {
           if (this.abort) {
             fetchParams.controller.off('terminated', this.abort)
-          }
-
-          if (fetchParams.controller.onAborted) {
-            fetchParams.controller.off('terminated', fetchParams.controller.onAborted)
           }
 
           fetchParams.controller.ended = true
@@ -33108,7 +33459,7 @@ function establishWebSocketConnection (url, protocols, client, ws, onEstablish, 
         // is specified, the server needs to include the same field and one of
         // the selected subprotocol values in its response for the connection to
         // be established.
-        if (!requestProtocols.includes(secProtocol)) {
+        if (requestProtocols === null || !requestProtocols.includes(secProtocol)) {
           failWebsocketConnection(ws, 'Protocol was not set in the opening handshake.')
           return
         }
@@ -33873,7 +34224,12 @@ class PerMessageDeflate {
 
         if (this.#maxPayloadSize > 0 && this.#inflate[kLength] > this.#maxPayloadSize) {
           callback(new MessageSizeExceededError())
+          // The inflater may still hold buffered input that can emit a late
+          // zlib error. Remove the data listener, then deterministically stop
+          // the stream so a subsequent 'error' cannot fire without a listener
+          // (which would terminate the process as an unhandled error event).
           this.#inflate.removeAllListeners()
+          this.#inflate.destroy()
           this.#inflate = null
           return
         }
@@ -34167,6 +34523,20 @@ class ByteParser extends Writable {
         if (isControlFrame(this.#info.opcode)) {
           this.#loop = this.parseControlFrame(body)
           this.#state = parserStates.INFO
+
+          // If the automatic PONG/CLOSE reply filled the socket's write buffer,
+          // stop parsing and resume on drain so a PING flood cannot grow the
+          // outbound queue without bound.
+          const socket = this.ws[kResponse].socket
+          if (this.#loop && socket.writableNeedDrain) {
+            this.#loop = false
+            socket.once('drain', () => {
+              if (this.destroyed) return
+              this.#loop = true
+              this.run(callback)
+            })
+            return
+          }
         } else {
           if (!this.#info.compressed) {
             if (!this.writeFragments(body)) {
@@ -37179,7 +37549,7 @@ module.exports = require("util");
 /***/ ((module) => {
 
 "use strict";
-module.exports = /*#__PURE__*/JSON.parse('{"_README":"The report the Action renders in FIXTURE MODE (no api-key). Captured 2026-09-13 from a local backend after `decimalai demo regression`, which seeds the two-minute demo\'s `[Demo] support-agent` (v1 -> v2: get_pricing renamed to lookup_price, compare_competitors removed, refund_order added, check_inventory gains an optional param, the system prompt rewritten, the model snapshot bumped) with 120 traces and runs the production regression check over them: 2 high / 118 medium / 0 low. Ids, hashes, timestamps and pr_context are placeholders; every other field is the backend\'s own answer. Regenerate: run a backend, `DECIMAL_API_KEY=<key> decimalai demo regression --base-url <url>`, then GET /api/v1/regression-check/{id} with the same key and re-apply the placeholders. The numbers must match docs.decimal.ai/tutorials/two-minute-demo and the README image, so the Action, the CLI demo and the docs tell one story.","id":"fixture-demo-support-agent","agent_name":"[Demo] support-agent","baseline_manifest_id":"fixture-manifest-v1","candidate_manifest_id":"fixture-manifest-v2","status":"completed","verdict":"high_risk","verdict_message":"2 traces will break. Review before merging. (also: 118 medium-risk affected)","structural_severity":"high","human_summary":"Renamed `get_pricing` → `lookup_price`, added tool `refund_order`, removed tool `compare_competitors`, changed `check_inventory` schema… +more changes.","high_risk_count":2,"medium_risk_count":118,"low_risk_count":0,"total_traces_analyzed":120,"diff_summary":{"total_changes":6,"high_severity_changes":1,"medium_severity_changes":3,"low_severity_changes":2,"changes":[{"type":"tool_renamed","name":"lookup_price","severity":"medium","detail":{"old_name":"get_pricing","new_name":"lookup_price","content_hash":"d57677263d45eed7"}},{"type":"model_changed","name":"gpt-4o-mini","severity":"medium","detail":{"severity":"moderate","change_type":"version_bump","old_model":"gpt-4o-mini-2024-07-18","new_model":"gpt-4o-mini-2024-09-12","grade":"moderate","change_kind":"version_bump","policy":{"name":"default","disposition":"flag","implies":"warn"}}},{"type":"prompt_section_rewritten","name":"system_prompt","severity":"medium","detail":{"diff_pct":88.6,"severity":"major","grade":"major","change_kind":"prompt_major","policy":{"name":"default","disposition":"replay","implies":"warn"}}},{"type":"tool_schema_optional_param_added","name":"check_inventory","severity":"low","detail":{"params":["region"]}},{"type":"tool_added","name":"refund_order","severity":"low","detail":{}},{"type":"tool_removed","name":"compare_competitors","severity":"high","detail":{}}]},"pr_context":null,"error_message":null,"created_at":"2026-09-13T00:00:00Z","eval_verdict":"regression_likely","eval_breakdown":{"passing_affected":15,"failing_affected":5,"unscored_affected":100,"eval_capped":false},"downstream_impact":{"evaluators":{"stale_count":0,"sample_evaluator_names":[],"surfaces_causing_staleness":["tool_removed: high","tool_renamed: medium","model_changed: medium"]},"datasets":{"affected_dataset_version_count":1,"sample_dataset_names":["[Demo] support-agent SFT set"],"total_rows_invalidated":10},"subagents":{"broken_handoffs":[]},"skills":{"affected_agent_count":0,"sample_agent_names":[],"skills_changed":[]}},"call_replay":null,"source":"fixture","baseline_manifest_label":"v1","baseline_manifest_hash":"000000000000","candidate_manifest_label":"v2","candidate_manifest_hash":"000000000000","human_decision":null,"impacts":[{"id":"ddbd5bcb-dc3a-4aeb-aa4c-f767df5895cd","surface_change_type":"tool_renamed","surface_name":"lookup_price","severity":"medium","affected_trace_count":1,"sample_trace_ids":["75d27b98-4f71-56b0-9dcb-a00089c47aa6"],"explanation":"1 traces called `get_pricing` (now renamed to `lookup_price`). Runtime resolution by content_hash will keep working, but hard-coded references to the old name in eval rules, telemetry filters, or downstream code will need updating.","eval_breakdown":{"passing_affected":1,"failing_affected":0,"unscored_affected":0,"sample_passing_trace_ids":["75d27b98-4f71-56b0-9dcb-a00089c47aa6"],"sample_failing_trace_ids":[],"sample_unscored_trace_ids":[],"failing_eval_details":[],"top_failing_evals":[]}},{"id":"c3a10643-d734-4919-b1cc-de186668145a","surface_change_type":"model_changed","surface_name":"gpt-4o-mini","severity":"medium","affected_trace_count":120,"sample_trace_ids":["75734f85-7546-5cbe-a39f-418c6f8d21dd","766e63d8-8fdf-5112-a10d-8b9f0891e567","60200eff-0ae6-573b-ae1d-d189694d096c","d49c18c6-183f-5372-9a45-9019799d0deb","3c86b73f-49ff-590e-b2ae-ac942e87a1b6"],"explanation":"Model version bump (gpt-4o-mini-2024-07-18 → gpt-4o-mini-2024-09-12) — moderate. All 120 traces in the window will use the new model. Behavioral direction can\'t be predicted structurally — use post-deploy bisect (CUJ 11) to verify actual impact.","eval_breakdown":{"passing_affected":15,"failing_affected":5,"unscored_affected":100,"sample_passing_trace_ids":["766e63d8-8fdf-5112-a10d-8b9f0891e567","60200eff-0ae6-573b-ae1d-d189694d096c","d49c18c6-183f-5372-9a45-9019799d0deb","3c86b73f-49ff-590e-b2ae-ac942e87a1b6","988dea1d-0ec3-50d9-93dd-418cda477be2"],"sample_failing_trace_ids":["75734f85-7546-5cbe-a39f-418c6f8d21dd","dc32839f-0d76-5838-9fb4-5d779835735b","0e452cd9-0c50-551f-b73e-b1c5aa265763","3aa817a2-fb82-51b7-98d6-c6d7bf597c84","cffe0827-747a-5019-ad7d-da2e78336f4c"],"sample_unscored_trace_ids":["3295775d-e720-4882-8cfe-3205513a3164","3008856a-cbb7-4db1-849b-e1e5dd2af46c","f0e87139-92ac-4335-bb8c-d6fc604b3810","ad33930c-0ba4-4192-ba7e-9e5a7c240258","c38c756e-91c0-4cc1-800c-35625705c70e"],"failing_eval_details":[{"trace_id":"75734f85-7546-5cbe-a39f-418c6f8d21dd","failed_evals":[{"name":"completion","score":0,"source":"built_in"},{"name":"quality","score":0.22,"source":"sdk"}]},{"trace_id":"dc32839f-0d76-5838-9fb4-5d779835735b","failed_evals":[{"name":"tool_compliance","score":0,"source":"built_in"},{"name":"tool:compare_competitors","score":0.15,"source":"compat_engine"}]},{"trace_id":"0e452cd9-0c50-551f-b73e-b1c5aa265763","failed_evals":[{"name":"tool_compliance","score":0,"source":"built_in"},{"name":"tool:compare_competitors","score":0.15,"source":"compat_engine"}]},{"trace_id":"3aa817a2-fb82-51b7-98d6-c6d7bf597c84","failed_evals":[{"name":"prompt:system_prompt","score":0.2,"source":"compat_engine"}]},{"trace_id":"cffe0827-747a-5019-ad7d-da2e78336f4c","failed_evals":[{"name":"prompt:system_prompt","score":0.2,"source":"compat_engine"}]}],"top_failing_evals":[{"name":"tool_compliance","fail_count":2,"avg_score":0},{"name":"tool:compare_competitors","fail_count":2,"avg_score":0.15},{"name":"prompt:system_prompt","fail_count":2,"avg_score":0.2},{"name":"completion","fail_count":1,"avg_score":0},{"name":"quality","fail_count":1,"avg_score":0.22}]}},{"id":"63a88eb4-5f36-48e7-b60f-648eab0dbd19","surface_change_type":"prompt_section_rewritten","surface_name":"system_prompt","severity":"medium","affected_trace_count":120,"sample_trace_ids":["75734f85-7546-5cbe-a39f-418c6f8d21dd","766e63d8-8fdf-5112-a10d-8b9f0891e567","60200eff-0ae6-573b-ae1d-d189694d096c","d49c18c6-183f-5372-9a45-9019799d0deb","3c86b73f-49ff-590e-b2ae-ac942e87a1b6"],"explanation":"Prompt section `system_prompt` major (88.6% changed). 120 traces in the last window may produce differently-worded outputs. Behavioral verification is needed to confirm direction.","eval_breakdown":{"passing_affected":15,"failing_affected":5,"unscored_affected":100,"sample_passing_trace_ids":["766e63d8-8fdf-5112-a10d-8b9f0891e567","60200eff-0ae6-573b-ae1d-d189694d096c","d49c18c6-183f-5372-9a45-9019799d0deb","3c86b73f-49ff-590e-b2ae-ac942e87a1b6","988dea1d-0ec3-50d9-93dd-418cda477be2"],"sample_failing_trace_ids":["75734f85-7546-5cbe-a39f-418c6f8d21dd","dc32839f-0d76-5838-9fb4-5d779835735b","0e452cd9-0c50-551f-b73e-b1c5aa265763","3aa817a2-fb82-51b7-98d6-c6d7bf597c84","cffe0827-747a-5019-ad7d-da2e78336f4c"],"sample_unscored_trace_ids":["3295775d-e720-4882-8cfe-3205513a3164","3008856a-cbb7-4db1-849b-e1e5dd2af46c","f0e87139-92ac-4335-bb8c-d6fc604b3810","ad33930c-0ba4-4192-ba7e-9e5a7c240258","c38c756e-91c0-4cc1-800c-35625705c70e"],"failing_eval_details":[{"trace_id":"75734f85-7546-5cbe-a39f-418c6f8d21dd","failed_evals":[{"name":"completion","score":0,"source":"built_in"},{"name":"quality","score":0.22,"source":"sdk"}]},{"trace_id":"dc32839f-0d76-5838-9fb4-5d779835735b","failed_evals":[{"name":"tool_compliance","score":0,"source":"built_in"},{"name":"tool:compare_competitors","score":0.15,"source":"compat_engine"}]},{"trace_id":"0e452cd9-0c50-551f-b73e-b1c5aa265763","failed_evals":[{"name":"tool_compliance","score":0,"source":"built_in"},{"name":"tool:compare_competitors","score":0.15,"source":"compat_engine"}]},{"trace_id":"3aa817a2-fb82-51b7-98d6-c6d7bf597c84","failed_evals":[{"name":"prompt:system_prompt","score":0.2,"source":"compat_engine"}]},{"trace_id":"cffe0827-747a-5019-ad7d-da2e78336f4c","failed_evals":[{"name":"prompt:system_prompt","score":0.2,"source":"compat_engine"}]}],"top_failing_evals":[{"name":"tool_compliance","fail_count":2,"avg_score":0},{"name":"tool:compare_competitors","fail_count":2,"avg_score":0.15},{"name":"prompt:system_prompt","fail_count":2,"avg_score":0.2},{"name":"completion","fail_count":1,"avg_score":0},{"name":"quality","fail_count":1,"avg_score":0.22}]}},{"id":"dd2463c8-05b2-40e3-b94c-304da1ba7d23","surface_change_type":"tool_schema_optional_param_added","surface_name":"check_inventory","severity":"low","affected_trace_count":3,"sample_trace_ids":["d5fdad52-8c31-5269-8596-cc9d9c48d105","a4a81636-6e33-503f-b12b-34ca077081e7","0b7a5c12-1346-5dd0-8cae-65eb726b9110"],"explanation":"3 traces called `check_inventory`. The new optional parameter will use its default value for these calls (low risk).","eval_breakdown":{"passing_affected":3,"failing_affected":0,"unscored_affected":0,"sample_passing_trace_ids":["d5fdad52-8c31-5269-8596-cc9d9c48d105","a4a81636-6e33-503f-b12b-34ca077081e7","0b7a5c12-1346-5dd0-8cae-65eb726b9110"],"sample_failing_trace_ids":[],"sample_unscored_trace_ids":[],"failing_eval_details":[],"top_failing_evals":[]}},{"id":"677987f3-ff85-4283-bfef-713a0bca5f4e","surface_change_type":"tool_added","surface_name":"refund_order","severity":"low","affected_trace_count":0,"sample_trace_ids":[],"explanation":"New tool `refund_order` added — no historical traces affected.","eval_breakdown":{"passing_affected":0,"failing_affected":0,"unscored_affected":0,"sample_passing_trace_ids":[],"sample_failing_trace_ids":[],"sample_unscored_trace_ids":[],"failing_eval_details":[],"top_failing_evals":[]}},{"id":"6a9b938d-0d35-4464-ae52-9c0f588932f9","surface_change_type":"tool_removed","surface_name":"compare_competitors","severity":"high","affected_trace_count":2,"sample_trace_ids":["0e452cd9-0c50-551f-b73e-b1c5aa265763","dc32839f-0d76-5838-9fb4-5d779835735b"],"explanation":"2 traces called the removed `compare_competitors` tool. These will error or fall back when this change ships.","eval_breakdown":{"passing_affected":0,"failing_affected":2,"unscored_affected":0,"sample_passing_trace_ids":[],"sample_failing_trace_ids":["0e452cd9-0c50-551f-b73e-b1c5aa265763","dc32839f-0d76-5838-9fb4-5d779835735b"],"sample_unscored_trace_ids":[],"failing_eval_details":[{"trace_id":"0e452cd9-0c50-551f-b73e-b1c5aa265763","failed_evals":[{"name":"tool_compliance","score":0,"source":"built_in"},{"name":"tool:compare_competitors","score":0.15,"source":"compat_engine"}]},{"trace_id":"dc32839f-0d76-5838-9fb4-5d779835735b","failed_evals":[{"name":"tool_compliance","score":0,"source":"built_in"},{"name":"tool:compare_competitors","score":0.15,"source":"compat_engine"}]}],"top_failing_evals":[{"name":"tool_compliance","fail_count":2,"avg_score":0},{"name":"tool:compare_competitors","fail_count":2,"avg_score":0.15}]}}]}');
+module.exports = /*#__PURE__*/JSON.parse('{"_README":"The report the Action renders in FIXTURE MODE (no api-key). Captured 2026-09-13 from a local backend after `decimalai demo regression`, which seeds the two-minute demo\'s `[Demo] support-agent` (v1 -> v2: get_pricing renamed to lookup_price, compare_competitors removed, refund_order added, check_inventory gains an optional param, the system prompt rewritten, the model snapshot bumped) with 120 traces and runs the production regression check over them: 2 high / 118 medium / 0 low. Ids, hashes, timestamps and pr_context are placeholders; every other field is the backend\'s own answer. Regenerate: run a backend, `DECIMAL_API_KEY=<key> decimalai demo regression --base-url <url>`, then GET /api/v1/regression-check/{id} with the same key and re-apply the placeholders. The numbers must match docs.decimal.ai/tutorials/two-minute-demo and the README image, so the Action, the CLI demo and the docs tell one story.","id":"fixture-demo-support-agent","agent_name":"[Demo] support-agent","baseline_manifest_id":"fixture-manifest-v1","candidate_manifest_id":"fixture-manifest-v2","status":"completed","verdict":"high_risk","verdict_message":"2 traces will break. Review before merging. (also: 118 medium-risk affected)","structural_severity":"high","human_summary":"Renamed `get_pricing` → `lookup_price`, added tool `refund_order`, removed tool `compare_competitors`, changed `check_inventory` schema… +more changes.","high_risk_count":2,"medium_risk_count":118,"low_risk_count":0,"total_traces_analyzed":120,"diff_summary":{"total_changes":6,"high_severity_changes":1,"medium_severity_changes":3,"low_severity_changes":2,"changes":[{"type":"tool_renamed","name":"lookup_price","severity":"medium","detail":{"old_name":"get_pricing","new_name":"lookup_price","content_hash":"d57677263d45eed7"}},{"type":"model_changed","name":"gpt-4o-mini","severity":"medium","detail":{"severity":"moderate","change_type":"version_bump","old_model":"gpt-4o-mini-2024-07-18","new_model":"gpt-4o-mini-2024-09-12","grade":"moderate","change_kind":"version_bump","policy":{"name":"default","disposition":"flag","implies":"warn"}}},{"type":"prompt_section_rewritten","name":"system_prompt","severity":"medium","detail":{"diff_pct":88.6,"severity":"major","grade":"major","change_kind":"prompt_major","policy":{"name":"default","disposition":"replay","implies":"warn"}}},{"type":"tool_schema_optional_param_added","name":"check_inventory","severity":"low","detail":{"params":["region"]}},{"type":"tool_added","name":"refund_order","severity":"low","detail":{}},{"type":"tool_removed","name":"compare_competitors","severity":"high","detail":{}}]},"pr_context":null,"error_message":null,"created_at":"2026-09-13T00:00:00Z","eval_verdict":"regression_likely","eval_breakdown":{"passing_affected":15,"failing_affected":5,"unscored_affected":100,"eval_capped":false},"downstream_impact":{"evaluators":{"stale_count":0,"sample_evaluator_names":[],"surfaces_causing_staleness":["tool_removed: high","tool_renamed: medium","model_changed: medium"]},"datasets":{"affected_dataset_version_count":1,"sample_dataset_names":["[Demo] support-agent SFT set"],"total_rows_invalidated":10},"subagents":{"broken_handoffs":[]},"skills":{"affected_agent_count":0,"sample_agent_names":[],"skills_changed":[]}},"call_replay":null,"source":"fixture","baseline_manifest_label":"v1","baseline_manifest_hash":"000000000000","candidate_manifest_label":"v2","candidate_manifest_hash":"000000000000","human_decision":null,"impacts":[{"id":"ddbd5bcb-dc3a-4aeb-aa4c-f767df5895cd","surface_change_type":"tool_renamed","surface_name":"lookup_price","severity":"medium","affected_trace_count":1,"sample_trace_ids":["75d27b98-4f71-56b0-9dcb-a00089c47aa6"],"explanation":"1 traces called `get_pricing` (now renamed to `lookup_price`). Runtime resolution by content_hash will keep working, but hard-coded references to the old name in eval rules, telemetry filters, or downstream code will need updating.","eval_breakdown":{"passing_affected":1,"failing_affected":0,"unscored_affected":0,"sample_passing_trace_ids":["75d27b98-4f71-56b0-9dcb-a00089c47aa6"],"sample_failing_trace_ids":[],"sample_unscored_trace_ids":[],"failing_eval_details":[],"top_failing_evals":[]}},{"id":"c3a10643-d734-4919-b1cc-de186668145a","surface_change_type":"model_changed","surface_name":"gpt-4o-mini","severity":"medium","affected_trace_count":120,"sample_trace_ids":["75734f85-7546-5cbe-a39f-418c6f8d21dd","766e63d8-8fdf-5112-a10d-8b9f0891e567","60200eff-0ae6-573b-ae1d-d189694d096c","d49c18c6-183f-5372-9a45-9019799d0deb","3c86b73f-49ff-590e-b2ae-ac942e87a1b6"],"explanation":"Model version bump (gpt-4o-mini-2024-07-18 → gpt-4o-mini-2024-09-12) — moderate. All 120 traces in the window will use the new model. Behavioral direction can\'t be predicted structurally — use post-deploy bisect to verify actual impact.","eval_breakdown":{"passing_affected":15,"failing_affected":5,"unscored_affected":100,"sample_passing_trace_ids":["766e63d8-8fdf-5112-a10d-8b9f0891e567","60200eff-0ae6-573b-ae1d-d189694d096c","d49c18c6-183f-5372-9a45-9019799d0deb","3c86b73f-49ff-590e-b2ae-ac942e87a1b6","988dea1d-0ec3-50d9-93dd-418cda477be2"],"sample_failing_trace_ids":["75734f85-7546-5cbe-a39f-418c6f8d21dd","dc32839f-0d76-5838-9fb4-5d779835735b","0e452cd9-0c50-551f-b73e-b1c5aa265763","3aa817a2-fb82-51b7-98d6-c6d7bf597c84","cffe0827-747a-5019-ad7d-da2e78336f4c"],"sample_unscored_trace_ids":["3295775d-e720-4882-8cfe-3205513a3164","3008856a-cbb7-4db1-849b-e1e5dd2af46c","f0e87139-92ac-4335-bb8c-d6fc604b3810","ad33930c-0ba4-4192-ba7e-9e5a7c240258","c38c756e-91c0-4cc1-800c-35625705c70e"],"failing_eval_details":[{"trace_id":"75734f85-7546-5cbe-a39f-418c6f8d21dd","failed_evals":[{"name":"completion","score":0,"source":"built_in"},{"name":"quality","score":0.22,"source":"sdk"}]},{"trace_id":"dc32839f-0d76-5838-9fb4-5d779835735b","failed_evals":[{"name":"tool_compliance","score":0,"source":"built_in"},{"name":"tool:compare_competitors","score":0.15,"source":"compat_engine"}]},{"trace_id":"0e452cd9-0c50-551f-b73e-b1c5aa265763","failed_evals":[{"name":"tool_compliance","score":0,"source":"built_in"},{"name":"tool:compare_competitors","score":0.15,"source":"compat_engine"}]},{"trace_id":"3aa817a2-fb82-51b7-98d6-c6d7bf597c84","failed_evals":[{"name":"prompt:system_prompt","score":0.2,"source":"compat_engine"}]},{"trace_id":"cffe0827-747a-5019-ad7d-da2e78336f4c","failed_evals":[{"name":"prompt:system_prompt","score":0.2,"source":"compat_engine"}]}],"top_failing_evals":[{"name":"tool_compliance","fail_count":2,"avg_score":0},{"name":"tool:compare_competitors","fail_count":2,"avg_score":0.15},{"name":"prompt:system_prompt","fail_count":2,"avg_score":0.2},{"name":"completion","fail_count":1,"avg_score":0},{"name":"quality","fail_count":1,"avg_score":0.22}]}},{"id":"63a88eb4-5f36-48e7-b60f-648eab0dbd19","surface_change_type":"prompt_section_rewritten","surface_name":"system_prompt","severity":"medium","affected_trace_count":120,"sample_trace_ids":["75734f85-7546-5cbe-a39f-418c6f8d21dd","766e63d8-8fdf-5112-a10d-8b9f0891e567","60200eff-0ae6-573b-ae1d-d189694d096c","d49c18c6-183f-5372-9a45-9019799d0deb","3c86b73f-49ff-590e-b2ae-ac942e87a1b6"],"explanation":"Prompt section `system_prompt` major (88.6% changed). 120 traces in the last window may produce differently-worded outputs. Behavioral verification is needed to confirm direction.","eval_breakdown":{"passing_affected":15,"failing_affected":5,"unscored_affected":100,"sample_passing_trace_ids":["766e63d8-8fdf-5112-a10d-8b9f0891e567","60200eff-0ae6-573b-ae1d-d189694d096c","d49c18c6-183f-5372-9a45-9019799d0deb","3c86b73f-49ff-590e-b2ae-ac942e87a1b6","988dea1d-0ec3-50d9-93dd-418cda477be2"],"sample_failing_trace_ids":["75734f85-7546-5cbe-a39f-418c6f8d21dd","dc32839f-0d76-5838-9fb4-5d779835735b","0e452cd9-0c50-551f-b73e-b1c5aa265763","3aa817a2-fb82-51b7-98d6-c6d7bf597c84","cffe0827-747a-5019-ad7d-da2e78336f4c"],"sample_unscored_trace_ids":["3295775d-e720-4882-8cfe-3205513a3164","3008856a-cbb7-4db1-849b-e1e5dd2af46c","f0e87139-92ac-4335-bb8c-d6fc604b3810","ad33930c-0ba4-4192-ba7e-9e5a7c240258","c38c756e-91c0-4cc1-800c-35625705c70e"],"failing_eval_details":[{"trace_id":"75734f85-7546-5cbe-a39f-418c6f8d21dd","failed_evals":[{"name":"completion","score":0,"source":"built_in"},{"name":"quality","score":0.22,"source":"sdk"}]},{"trace_id":"dc32839f-0d76-5838-9fb4-5d779835735b","failed_evals":[{"name":"tool_compliance","score":0,"source":"built_in"},{"name":"tool:compare_competitors","score":0.15,"source":"compat_engine"}]},{"trace_id":"0e452cd9-0c50-551f-b73e-b1c5aa265763","failed_evals":[{"name":"tool_compliance","score":0,"source":"built_in"},{"name":"tool:compare_competitors","score":0.15,"source":"compat_engine"}]},{"trace_id":"3aa817a2-fb82-51b7-98d6-c6d7bf597c84","failed_evals":[{"name":"prompt:system_prompt","score":0.2,"source":"compat_engine"}]},{"trace_id":"cffe0827-747a-5019-ad7d-da2e78336f4c","failed_evals":[{"name":"prompt:system_prompt","score":0.2,"source":"compat_engine"}]}],"top_failing_evals":[{"name":"tool_compliance","fail_count":2,"avg_score":0},{"name":"tool:compare_competitors","fail_count":2,"avg_score":0.15},{"name":"prompt:system_prompt","fail_count":2,"avg_score":0.2},{"name":"completion","fail_count":1,"avg_score":0},{"name":"quality","fail_count":1,"avg_score":0.22}]}},{"id":"dd2463c8-05b2-40e3-b94c-304da1ba7d23","surface_change_type":"tool_schema_optional_param_added","surface_name":"check_inventory","severity":"low","affected_trace_count":3,"sample_trace_ids":["d5fdad52-8c31-5269-8596-cc9d9c48d105","a4a81636-6e33-503f-b12b-34ca077081e7","0b7a5c12-1346-5dd0-8cae-65eb726b9110"],"explanation":"3 traces called `check_inventory`. The new optional parameter will use its default value for these calls (low risk).","eval_breakdown":{"passing_affected":3,"failing_affected":0,"unscored_affected":0,"sample_passing_trace_ids":["d5fdad52-8c31-5269-8596-cc9d9c48d105","a4a81636-6e33-503f-b12b-34ca077081e7","0b7a5c12-1346-5dd0-8cae-65eb726b9110"],"sample_failing_trace_ids":[],"sample_unscored_trace_ids":[],"failing_eval_details":[],"top_failing_evals":[]}},{"id":"677987f3-ff85-4283-bfef-713a0bca5f4e","surface_change_type":"tool_added","surface_name":"refund_order","severity":"low","affected_trace_count":0,"sample_trace_ids":[],"explanation":"New tool `refund_order` added — no historical traces affected.","eval_breakdown":{"passing_affected":0,"failing_affected":0,"unscored_affected":0,"sample_passing_trace_ids":[],"sample_failing_trace_ids":[],"sample_unscored_trace_ids":[],"failing_eval_details":[],"top_failing_evals":[]}},{"id":"6a9b938d-0d35-4464-ae52-9c0f588932f9","surface_change_type":"tool_removed","surface_name":"compare_competitors","severity":"high","affected_trace_count":2,"sample_trace_ids":["0e452cd9-0c50-551f-b73e-b1c5aa265763","dc32839f-0d76-5838-9fb4-5d779835735b"],"explanation":"2 traces called the removed `compare_competitors` tool. These will error or fall back when this change ships.","eval_breakdown":{"passing_affected":0,"failing_affected":2,"unscored_affected":0,"sample_passing_trace_ids":[],"sample_failing_trace_ids":["0e452cd9-0c50-551f-b73e-b1c5aa265763","dc32839f-0d76-5838-9fb4-5d779835735b"],"sample_unscored_trace_ids":[],"failing_eval_details":[{"trace_id":"0e452cd9-0c50-551f-b73e-b1c5aa265763","failed_evals":[{"name":"tool_compliance","score":0,"source":"built_in"},{"name":"tool:compare_competitors","score":0.15,"source":"compat_engine"}]},{"trace_id":"dc32839f-0d76-5838-9fb4-5d779835735b","failed_evals":[{"name":"tool_compliance","score":0,"source":"built_in"},{"name":"tool:compare_competitors","score":0.15,"source":"compat_engine"}]}],"top_failing_evals":[{"name":"tool_compliance","fail_count":2,"avg_score":0},{"name":"tool:compare_competitors","fail_count":2,"avg_score":0.15}]}}]}');
 
 /***/ })
 
